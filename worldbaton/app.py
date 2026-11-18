@@ -32,10 +32,15 @@ class App:
         self.root, self.cfg, self.group, self.st = root, load_config(), None, None
         self.busy = False
         root.title(f"WorldBaton {__version__}")
-        root.minsize(480, 380)
+        root.minsize(520, 460)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.body = ttk.Frame(root, padding=16)
-        self.body.pack(fill="both", expand=True)
+        self.tabs = ttk.Notebook(root)
+        self.tabs.pack(fill="both", expand=True)
+        self.body = ttk.Frame(self.tabs, padding=16)
+        self.guide = ttk.Frame(self.tabs, padding=16)
+        self.tabs.add(self.body, text="My group")
+        self.tabs.add(self.guide, text="Setup guide")
+        self.build_guide()
         ttk.Label(self.body, text="Starting sync engine…").pack()
         self.error = None
         threading.Thread(target=self._start_engine, daemon=True).start()
@@ -59,6 +64,7 @@ class App:
             self.root.after(200, self._wait_engine)
             return
         if not self.cfg.get("player"):
+            self.tabs.select(self.guide)  # first run: show how it works
             name = simpledialog.askstring("WorldBaton", "Your name (friends will see this):", parent=self.root)
             self.cfg["player"] = (name or os.environ.get("USERNAME") or "Player").strip()[:32]
             save_config(self.cfg)
@@ -70,6 +76,56 @@ class App:
         self.check_updates()
 
     # --- screens -----------------------------------------------------------------
+    GUIDE = [
+        ("h", "Before you start"),
+        ("p", "• Everyone who wants to take turns hosting needs WorldBaton and SquidServers. "
+              "Friends who only play just need Minecraft."),
+        ("p", "• Make a copy of your server folder before the first time, just in case."),
+        ("h", "Starting a group (the owner)"),
+        ("p", "1. Stop your server in SquidServers."),
+        ("p", "2. In My group, press Create a group from my server and pick your server folder "
+              "(SquidServers keeps them in %LOCALAPPDATA%\\SquidServers)."),
+        ("p", "3. Press Invite a friend and send them the invite code."),
+        ("p", "4. Paste the join code they send back and press Add friend."),
+        ("h", "Joining a friend's group"),
+        ("p", "1. Press Join a friend's group and paste their invite code."),
+        ("p", "2. Send the join code WorldBaton shows back to your friend."),
+        ("p", "3. Wait for the world to copy over (your friend's list shows you at 100%)."),
+        ("p", "4. In SquidServers, create a new server with the SAME type and Minecraft version as the group's "
+              "(for example NeoForge 1.21.1) and a different name. Don't add mods. Let it install, then keep it stopped."),
+        ("p", "5. Back in My group, press Change server folder… and pick that new server's folder. "
+              "WorldBaton fills it with the group's world, mods and settings."),
+        ("h", "Taking turns hosting"),
+        ("p", "1. Press Host now. The first time, paste your tunnel address from SquidServers "
+              "(change it later with My address…)."),
+        ("p", "2. Start the server in SquidServers. Friends see your address in WorldBaton."),
+        ("p", "3. When you're done, stop the server in SquidServers FIRST, then press Stop hosting."),
+        ("p", "4. Keep WorldBaton open until your friends show 100% synced."),
+        ("p", "• Only start the server when WorldBaton says you're the host. Anything played otherwise is undone."),
+        ("h", "Rarely online at the same time?"),
+        ("p", "• Share a Google Drive, OneDrive or Dropbox folder with the group and install that drive's desktop app."),
+        ("p", "• Press Backup folder… and pick your copy of that shared folder. Everyone does this on their own PC."),
+        ("p", "• After Stop hosting, wait until the drive app says it's up to date before turning off your PC."),
+    ]
+
+    def build_guide(self):
+        g = self.guide
+        text = tk.Text(g, wrap="word", relief="flat", padx=4, pady=4, height=18,
+                       background=self.root.cget("background"), font=("Segoe UI", 10))
+        bar = ttk.Scrollbar(g, command=text.yview)
+        text.config(yscrollcommand=bar.set)
+        text.tag_config("h", font=("Segoe UI", 11, "bold"), spacing1=10, spacing3=4)
+        text.tag_config("p", lmargin1=4, lmargin2=18, spacing3=3)
+        for tag, line in self.GUIDE:
+            text.insert("end", line + "\n", tag)
+        text.config(state="disabled")
+        foot = ttk.Frame(g)
+        foot.pack(side="bottom", fill="x", pady=(8, 0))
+        ttk.Label(foot, text=f"WorldBaton {__version__}", foreground="#555").pack(side="left")
+        ttk.Button(foot, text="Check for updates", command=lambda: self.check_updates(manual=True)).pack(side="right")
+        bar.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+
     def clear(self):
         for w in self.body.winfo_children():
             w.destroy()
@@ -387,17 +443,21 @@ class App:
         self.root.destroy()
 
     # --- updates -----------------------------------------------------------------
-    def check_updates(self):
-        updater.clean_old()
+    def check_updates(self, manual=False):
+        """On start: quietly offer an update if there is one. From the button: also say when there isn't."""
+        if not manual:
+            updater.clean_old()
         if not updater.can_update():
+            if manual:
+                messagebox.showinfo("WorldBaton", "Updates only work in the downloaded WorldBaton.exe.")
             return
         found = {}
 
         def run():
             try:
                 found["r"] = updater.latest()
-            except Exception:
-                found["r"] = None  # offline or GitHub unreachable: try again next start
+            except Exception as e:
+                found["r"], found["err"] = None, e  # offline or GitHub unreachable: try again next start
         threading.Thread(target=run, daemon=True).start()
 
         def poll():
@@ -405,6 +465,10 @@ class App:
                 self.root.after(500, poll)
             elif found["r"]:
                 self.offer_update(*found["r"])
+            elif manual and "err" in found:
+                messagebox.showerror("WorldBaton", f"Couldn't check for updates. Are you online?\n({found['err']})")
+            elif manual:
+                messagebox.showinfo("WorldBaton", f"You're up to date (WorldBaton {__version__}).")
         poll()
 
     def offer_update(self, tag, url):
