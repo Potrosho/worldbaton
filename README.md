@@ -56,11 +56,18 @@ If your PC crashes while hosting, reopen WorldBaton: as long as nobody took over
   session is shared once you press *Stop hosting*.
 - You can only host when your copy matches the newest version. If the host's PC dies,
   friends can take over after 5 minutes without a heartbeat (that session is lost).
-- Mods and operators: when the server's `mods` folder or `ops.json` changes, everyone sees what changed
-  (install the same mods in your own Minecraft to keep joining).
-- Host activity: while you host, admin commands from the server log (op, gamemode, give, tp, ban…) are
-  shared with the group. It catches casual abuse, not a determined cheater: the host controls their own
-  PC and could turn logging off or edit files. Operator changes are seen either way, since `ops.json` syncs.
+- Changes: when the server's mods, operators, datapacks, risky `server.properties` settings (RCON, command
+  blocks, op level, online mode…) or logging gamerules change, everyone sees what changed (install the same
+  mods in your own Minecraft to keep joining).
+- Host activity: while you host, WorldBaton reads the server log every few seconds and shares admin commands
+  (op, gamemode, give, tp, ban…, from players, the console, command blocks and RCON) with the group. It also
+  flags ways around that: the log being edited, cut, replaced or not written; mods loaded from outside
+  `mods/` (NeoForge); files changed while the server was off (NBT editors, copied-in worlds); WorldBaton being
+  closed mid-session; and logging turned off by gamerule. Each PC keeps what it has seen, so entries deleted
+  from a host's list stay visible, and a list changed by a PC other than its owner is flagged.
+- What it can't catch: faked file timestamps, a modified server jar, client-side cheats (x-ray, fly), a wrong PC
+  clock, and `/execute as Friend run …`, which the server logs under the friend's name (the list always shows
+  who was hosting too). With `online-mode=false`, names aren't verified at all; WorldBaton warns about that.
 - Logs, crash reports, caches and SquidServers' per-PC files (`squidservers/`,
   `.mc_server_state.json`) are not synced. Each person's tunnel stays their own.
 

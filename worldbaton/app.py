@@ -120,7 +120,9 @@ class App:
         ("p", "• When the host adds or removes a mod, everyone sees it under My group. Put the same mod in your own "
               "Minecraft's mods folder too, or you can't join."),
         ("p", "• Admin commands (op, gamemode, give, tp…) used on the server are listed under Host activity for the whole "
-              "group, and so are changes to who is an operator."),
+              "group. So are signs someone tried to hide them: an edited server log, files changed while the server "
+              "was off, or mods loaded from somewhere else. Those show in red."),
+        ("p", "• Operators, datapacks and important server settings are watched too, like mods."),
         ("h", "Rarely online at the same time?"),
         ("p", "• Share a Google Drive, OneDrive or Dropbox folder with the group and install that drive's desktop app."),
         ("p", "• Press Backup folder… and pick your copy of that shared folder. Everyone does this on their own PC."),
@@ -226,6 +228,12 @@ class App:
             self.root.after(REFRESH_MS, self.tick)
             return
         self.last_status = s
+        if s["me_hosting"]:
+            try:  # every refresh, so there's little time to edit the log before it's read
+                self.group.record_activity(self.cfg["player"])
+                self.group.watch_offline_edits(self.cfg["player"])
+            except Exception:
+                pass
         baton = s["baton"] or {}
         self.address.pack_forget()
         self.copy_btn.pack_forget()
@@ -252,6 +260,9 @@ class App:
             warns.append("Two people changed the baton at the same time. Check who is really hosting before playing.")
         if s["server_running"] and not s["me_hosting"]:
             warns.append("Your server is running but you aren't the host! Stop it, or your changes will be lost.")
+        self.show_changes(s)
+        if self.snapshot:
+            warns += core.watch_warnings(self.snapshot)
         self.warning.config(text="\n".join(warns))
 
         self.members.config(state="normal")
@@ -262,7 +273,6 @@ class App:
         if not s["members"]:
             self.members.insert("end", "No friends yet. Press 'Invite a friend'.")
         self.members.config(state="disabled")
-        self.show_changes(s)
         self.show_activity()
 
         self.host_btn.config(state="normal" if s["can_host"] else "disabled")
@@ -287,7 +297,7 @@ class App:
         more = f"\n…and {len(changes) - 8} more" if len(changes) > 8 else ""
         self.changes.config(text="Changed since you last looked:\n" + "\n".join(changes[:8]) + more +
                             ("\nAdd/remove the same mods in your own Minecraft to keep joining."
-                             if any("mod" in c for c in changes) else ""))
+                             if any(c.startswith(("New mod", "Mod removed")) for c in changes) else ""))
         self.changes.pack(anchor="w", pady=(8, 0))
         self.changes_row.pack(anchor="w", pady=(4, 0))
 
@@ -305,9 +315,13 @@ class App:
         self.activity_shown = entries
         self.activity.config(state="normal")
         self.activity.delete("1.0", "end")
+        self.activity.tag_config("warn", foreground="#ff8080")
         for e in entries:
             when = time.strftime("%d %b %H:%M", time.localtime(e.get("t", 0)))
-            self.activity.insert("end", f"{when}  hosted by {e.get('host', '?')} — {e.get('text', '')}\n")
+            who = f"hosted by {e['host']} — " if e.get("host") else ""
+            gone = "  (deleted from the host's list since)" if e.get("removed") else ""
+            warn = e.get("removed") or e.get("text", "").startswith("⚠")
+            self.activity.insert("end", f"{when}  {who}{e.get('text', '')}{gone}\n", ("warn",) if warn else ())
         if not entries:
             self.activity.insert("end", "Nothing yet. Commands like /op, /gamemode and /give show up here.")
         self.activity.config(state="disabled")

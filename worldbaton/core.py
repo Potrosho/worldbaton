@@ -12,6 +12,7 @@ online at the same time: each finished session is zipped there, and the baton is
 import base64
 import ctypes
 import fnmatch
+import gzip
 import json
 import os
 import re
@@ -29,13 +30,25 @@ KEEP_ACTIVITY = 500    # admin-log entries kept per PC
 # Server log lines: NeoForge "[20Sep2026 11:57:08.841] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: msg",
 # vanilla "[11:57:08] [Server thread/INFO]: msg".
 LOG_LINE = re.compile(r"^\[([^\]]+)\] \[Server thread/INFO\](?: \[[^\]]*\])?: (.*)$")
-PLAYER_COMMAND = re.compile(r"^\[(\w{1,16}): (.*)\]$")  # logAdminCommands: "[Potrosh0: Gave 34 [Diamond] to X]"
+# logAdminCommands: "[Potrosh0: Gave 34 [Diamond] to X]". The source can also be a command block ("@"), "Rcon", a named block.
+SOURCE_COMMAND = re.compile(r"^\[([^\[\]:]{1,40}): (.*)\]$")
 # shortcut: console commands have no "who" marker, so only these common admin results are caught; add more as found.
 CONSOLE_COMMAND = re.compile(
     r"^(Made \S+ (a|no longer a) server operator|Set \S+'s game mode|Set own game mode|Gave |Teleported |"
-    r"Gamerule |Set the (time|weather|difficulty|world spawn)|Set spawn point|Banned |Unbanned |Kicked |Killed |"
-    r"Summoned |Applied effect|Removed \d+ item|Cleared the inventory|Enchanting succeeded|Added .* to the whitelist|"
-    r"Removed .* from the whitelist|Whitelist is now)")
+    r"Gamerule |Set the (time|weather|difficulty|world spawn|world border)|Set spawn point|Banned |Unbanned |Kicked |"
+    r"Killed |Summoned |Applied (effect|enchantment)|Removed \d+ item|Cleared the inventory|Enchanting succeeded|"
+    r"Added .* to the whitelist|Removed .* from the whitelist|Whitelist is now|Granted |Revoked |Successfully (filled|cloned)|"
+    r"Changed the block|Placed |Executed \d+ command|Set \d+ |Modified )")
+# NeoForge debug.log: 'Found mod file "x.jar" [locator: {mods folder locator at C:\...\mods}, reader: mod manifest]'
+FOUND_MOD = re.compile(r'^\[([^\]]+)\] .*Found mod file "([^"]+)" \[locator: (.*)$')
+# shortcut: NeoForge's own places for mods; other loaders' debug logs aren't checked.
+NORMAL_LOCATORS = ("jarinjar", "production server provider", "PathBasedLocator[name=neoforge,", "org.sinytra.connector")
+WATCHED_RULES = ("logAdminCommands", "commandBlockOutput")
+WATCHED_SETTINGS = ("enable-command-block", "enable-rcon", "op-permission-level", "function-permission-level",
+                    "online-mode", "white-list", "enforce-whitelist", "gamemode", "force-gamemode", "difficulty", "pvp",
+                    "allow-flight", "spawn-protection", "level-name", "level-seed")
+# Written by SquidServers itself before each start; their watched settings are compared instead.
+NOT_EDITS = {"server.properties", "eula.txt", VERSION_FILE}
 
 # Per-PC or throwaway files. SquidServers keeps its own state/tunnel data in these too,
 # and writes start scripts with this PC's Java path and RAM setting.
@@ -161,13 +174,24 @@ def pid_alive(pid: int) -> bool:
         return False
 
 
-def server_running(world_path: Path) -> bool:
-    """True if SquidServers reports this server online and its process exists."""
+def server_state(world_path: Path) -> dict:
+    """SquidServers' .mc_server_state.json: status, pid and ts (ms, when it was written)."""
     try:
         state = json.loads((Path(world_path) / ".mc_server_state.json").read_text())
+        return state if isinstance(state, dict) else {}
     except (OSError, ValueError):
-        return False
-    return state.get("status") == "online" and isinstance(state.get("pid"), int) and pid_alive(state["pid"])
+        return {}
+
+
+def server_pid(world_path: Path) -> int | None:
+    """The server's process id while that process exists (even while it is still saving on shutdown)."""
+    pid = server_state(world_path).get("pid")
+    return pid if isinstance(pid, int) and pid_alive(pid) else None
+
+
+def server_running(world_path: Path) -> bool:
+    """True if SquidServers reports this server online and its process exists."""
+    return server_state(world_path).get("status") == "online" and server_pid(world_path) is not None
 
 
 def admin_line(line: str) -> tuple[str, str] | None:
@@ -176,30 +200,139 @@ def admin_line(line: str) -> tuple[str, str] | None:
     if not m:
         return None
     at, msg = m.groups()
-    if p := PLAYER_COMMAND.match(msg):
+    if p := SOURCE_COMMAND.match(msg):
         return at, f"{p[1]}: {p[2]}"
     if CONSOLE_COMMAND.match(msg):
         return at, f"Console: {msg}"
+    if "logAdminCommands" in msg or "commandBlockOutput" in msg:
+        return at, f"⚠ {msg}"
     return None
 
 
+def odd_mod_line(line: str, mods_dir: Path) -> tuple[str, str] | None:
+    """A debug.log line saying the server loaded a mod from outside the synced mods folder."""
+    m = FOUND_MOD.match(line.rstrip("\r\n"))
+    if not m:
+        return None
+    at, jar, locator = m.groups()
+    prefix = "{mods folder locator at "
+    if locator.startswith(prefix):
+        folder = locator[len(prefix):].split("}", 1)[0]
+        if os.path.normcase(os.path.normpath(folder)) == os.path.normcase(os.path.normpath(mods_dir)):
+            return None
+    elif locator.startswith(NORMAL_LOCATORS):
+        return None
+    return at, f"⚠ The server loaded a mod from outside the mods folder: {jar} ({locator[:100]})"
+
+
+def read_settings(world_path: Path) -> dict:
+    try:
+        text = (Path(world_path) / "server.properties").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    pairs = (line.split("=", 1) for line in text.splitlines() if "=" in line and not line.lstrip().startswith("#"))
+    return {k.strip(): v.strip() for k, v in pairs}
+
+
+def read_gamerules(level_dat: Path) -> dict:
+    """The watched gamerules in level.dat. They're NBT string tags: 0x08, name length, name, value length, value."""
+    # shortcut: finds the tags by bytes instead of parsing NBT; newer Minecraft versions that store gamerules
+    # differently just show no gamerules, and the warning about them never appears.
+    try:
+        with gzip.open(level_dat) as f:
+            data = f.read()
+    except (OSError, EOFError):
+        return {}
+    rules = {}
+    for name in WATCHED_RULES:
+        key = b"\x08" + len(name).to_bytes(2, "big") + name.encode()
+        i = data.find(key)
+        if i >= 0:
+            j = i + len(key)
+            n = int.from_bytes(data[j:j + 2], "big")
+            rules[name] = data[j + 2:j + 2 + n].decode("utf-8", "replace")
+    return rules
+
+
 def server_snapshot(world_path: Path) -> dict:
-    """Mods and operators in a server folder, to tell players when they change."""
+    """What players should hear about when it changes: mods, operators, datapacks, risky settings, gamerules."""
     world_path = Path(world_path)
     try:
         ops = sorted({o["name"] for o in json.loads((world_path / "ops.json").read_text())})
     except (OSError, ValueError, KeyError, TypeError):
         ops = []
-    return {"mods": sorted(p.name for p in (world_path / "mods").glob("*.jar")), "ops": ops}
+    settings = read_settings(world_path)
+    level = world_path / (settings.get("level-name") or "world")
+    packs = sorted({f"{d.parent.name}/datapacks/{p.name}" if d.parent != world_path else p.name
+                    for d in (world_path / "datapacks", level / "datapacks") if d.is_dir() for p in d.iterdir()})
+    return {"mods": sorted(p.name for p in (world_path / "mods").glob("*.jar")), "ops": ops, "datapacks": packs,
+            "settings": {k: settings[k] for k in WATCHED_SETTINGS if k in settings},
+            "rules": read_gamerules(level / "level.dat")}
 
 
 def snapshot_changes(old: dict, new: dict) -> list[str]:
-    old_mods, new_mods = set(old.get("mods", [])), set(new["mods"])
-    old_ops, new_ops = set(old.get("ops", [])), set(new["ops"])
-    return ([f"New mod: {m}" for m in sorted(new_mods - old_mods)] +
-            [f"Mod removed: {m}" for m in sorted(old_mods - new_mods)] +
-            [f"Now an operator: {o}" for o in sorted(new_ops - old_ops)] +
-            [f"No longer an operator: {o}" for o in sorted(old_ops - new_ops)])
+    def added_removed(key, added, removed):
+        if key not in old:
+            return []
+        a, b = set(old[key]), set(new[key])
+        return [f"{added}: {x}" for x in sorted(b - a)] + [f"{removed}: {x}" for x in sorted(a - b)]
+
+    def values(key, label):
+        if key not in old:
+            return []
+        a, b = old[key], new[key]
+        return [f"{label} {k}: {a.get(k, '(not set)')} → {b.get(k, '(not set)')}"
+                for k in sorted(a.keys() | b.keys()) if a.get(k) != b.get(k)]
+
+    return (added_removed("mods", "New mod", "Mod removed") + added_removed("ops", "Now an operator", "No longer an operator") +
+            added_removed("datapacks", "New datapack", "Datapack removed") +
+            values("settings", "Server setting") + values("rules", "Gamerule"))
+
+
+def watch_warnings(snapshot: dict) -> list[str]:
+    """Settings that blind the activity list, shown to everyone for as long as they're set."""
+    rules, settings = snapshot.get("rules", {}), snapshot.get("settings", {})
+    out = []
+    if rules.get("logAdminCommands") == "false":
+        out.append("Admin commands aren't logged in this world (gamerule logAdminCommands is false), "
+                   "so Host activity can't see them.")
+    if settings.get("enable-command-block") == "true" and rules.get("commandBlockOutput") == "false":
+        out.append("Command blocks are on and their commands aren't logged (gamerule commandBlockOutput is false).")
+    if settings.get("enable-rcon") == "true":
+        out.append("RCON (remote console) is on: someone with its password can run commands from outside the game.")
+    if settings.get("online-mode") == "false":
+        out.append("Names aren't checked (online-mode is false): anyone can join as someone else, even an operator, "
+                   "and their commands are logged under that name.")
+    return out
+
+
+def file_marks(world_path: Path) -> dict:
+    """Size and modified time of every synced file, to spot files changed outside the game."""
+    world_path, out = Path(world_path), {}
+    for p in world_path.rglob("*"):
+        rel = p.relative_to(world_path).as_posix()
+        if rel in NOT_EDITS or skipped(rel):
+            continue
+        try:
+            if p.is_file():
+                info = p.stat()
+                out[rel] = [info.st_mtime_ns, info.st_size]
+        except OSError:
+            pass
+    return out
+
+
+def describe_edits(before: dict, after: dict, world_path: Path) -> str | None:
+    changed = sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))
+    if not changed:
+        return None
+    try:
+        names = {u["uuid"]: u["name"] for u in json.loads((Path(world_path) / "usercache.json").read_text())}
+    except (OSError, ValueError, KeyError, TypeError):
+        names = {}
+    shown = [f"{c} ({names[Path(c).stem]})" if Path(c).stem in names else c for c in changed[:6]]
+    more = f" (+{len(changed) - 6} more)" if len(changed) > 6 else ""
+    return f"⚠ Files changed while the server was off, not by the game: {', '.join(shown)}{more}"
 
 
 def replace_synced_files(src: Path, dest: Path, move: bool) -> None:
@@ -223,7 +356,8 @@ class Group:
         self.world_path = Path(info["world_path"])
         self.app_dir = Path(app_dir)
         self.baton_file = self.app_dir / f"baton-{self.baton_id}" / "baton.json"
-        self._log_at = None  # (latest.log creation time, bytes already read)
+        self._logs = {}  # per log file: creation time, bytes read, last bytes read, server pid
+        self._by = {}    # activity file -> (mtime, short ID of the PC that last changed it)
 
     @property
     def backup_dir(self) -> Path | None:
@@ -438,29 +572,70 @@ class Group:
     def activity_file(self) -> Path:
         return self.baton_file.parent / f"activity-{self.st.my_id[:7]}.jsonl"
 
-    def _new_log_lines(self) -> list[str]:
-        log = self.world_path / "logs" / "latest.log"
+    @property
+    def _marks_file(self) -> Path:
+        return self.app_dir / f"offline-marks-{self.world_id}.json"
+
+    @property
+    def _seen_file(self) -> Path:
+        return self.app_dir / f"activity-seen-{self.baton_id}.json"
+
+    def _new_log_lines(self, name: str) -> tuple[list[str], str | None]:
+        """New complete lines of logs/<name> since the last read, and a warning if it was edited in between."""
+        log = self.world_path / "logs" / name
         try:
             info = log.stat()
         except OSError:
-            return []
+            return [], None
         born = getattr(info, "st_birthtime", info.st_ctime)
-        seen_born, pos = self._log_at or (None, 0)
-        if born != seen_born or info.st_size < pos:
-            pos = 0  # server restarted: a new latest.log
+        pid = server_pid(self.world_path)
+        prev = self._logs.get(name)
+        pos, warning = 0, None
         with open(log, "rb") as f:
+            if prev and prev["born"] == born:
+                f.seek(max(0, prev["pos"] - len(prev["tail"])))
+                if info.st_size < prev["pos"] or f.read(len(prev["tail"])) != prev["tail"]:
+                    warning = f"⚠ The server log ({name}) was edited or cut while hosting."
+                else:
+                    pos = prev["pos"]
+            elif prev and pid and prev["pid"] == pid:
+                warning = f"⚠ The server log ({name}) was replaced while the server kept running."
             f.seek(pos)
             data = f.read()
-        end = data.rfind(b"\n") + 1  # leave a half-written last line for next time
-        self._log_at = (born, pos + end)
-        return data[:end].decode("utf-8", "replace").splitlines()
+            end = pos + data.rfind(b"\n") + 1  # leave a half-written last line for next time
+            f.seek(max(0, end - 64))
+            tail = f.read(end - max(0, end - 64))
+        self._logs[name] = {"born": born, "pos": end, "tail": tail, "pid": pid}
+        return data[:end - pos].decode("utf-8", "replace").splitlines(), warning
 
     def _skip_old_log(self) -> None:
-        self._log_at = None
-        self._new_log_lines()
+        self._logs = {}
+        for name in ("latest.log", "debug.log"):
+            self._new_log_lines(name)
 
     def record_activity(self, player) -> None:
-        found = [a for a in map(admin_line, self._new_log_lines()) if a]
+        """Read the server logs for admin commands and signs of tampering (called every few seconds while hosting)."""
+        now = time.strftime("%d%b%Y %H:%M:%S")
+        lines, warn = self._new_log_lines("latest.log")
+        found = [a for a in map(admin_line, lines) if a]
+        debug, debug_warn = self._new_log_lines("debug.log")
+        found += [a for a in (odd_mod_line(line, self.world_path / "mods") for line in debug) if a]
+        found += [(now, w) for w in (warn, debug_warn) if w]
+        pid, state = server_pid(self.world_path), server_state(self.world_path)
+        log = self.world_path / "logs" / "latest.log"
+        if pid and isinstance(state.get("ts"), (int, float)):
+            # A running server writes latest.log as it starts. If it hasn't since well before SquidServers marked it
+            # started, file logging was turned off (e.g. a custom log setup in this PC's JVM arguments).
+            try:
+                stale = log.stat().st_mtime < state["ts"] / 1000 - 600
+            except OSError:
+                stale = True
+            if stale:
+                found.append((f"no-log-{pid}", "⚠ The server is running but isn't writing its log, "
+                                               "so its commands can't be seen."))
+        self.add_activity(player, found)
+
+    def add_activity(self, player, found: list[tuple[str, str]]) -> None:
         if not found:
             return
         entries = self.read_activity_file(self.activity_file)
@@ -472,6 +647,22 @@ class Group:
         os.replace(tmp, self.activity_file)
         self.st.scan(self.baton_id)
 
+    def watch_offline_edits(self, player) -> None:
+        """While hosting: remember the files when the server stops, report what changed by the time it starts again."""
+        alive = server_pid(self.world_path) is not None
+        if not alive and not self._marks_file.exists():
+            self._write_json(self._marks_file, file_marks(self.world_path))
+        elif alive and self._marks_file.exists():
+            self.report_offline_edits(player)
+
+    def report_offline_edits(self, player) -> None:
+        before = self._read_json(self._marks_file)
+        if before is not None:
+            text = describe_edits(before, file_marks(self.world_path), self.world_path)
+            if text:
+                self.add_activity(player, [(time.strftime("%d%b%Y %H:%M:%S"), text)])
+        self._marks_file.unlink(missing_ok=True)
+
     @staticmethod
     def read_activity_file(path: Path) -> list[dict]:
         try:
@@ -479,11 +670,49 @@ class Group:
         except (OSError, ValueError):
             return []
 
+    def _modified_by(self, path: Path) -> str | None:
+        """Short ID of the PC that last changed a synced file (Syncthing knows), cached until the file changes."""
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            return None
+        cached = self._by.get(path.name)
+        if not cached or cached[0] != mtime:
+            try:
+                by = self.st.get(f"/rest/db/file?folder={self.baton_id}&file={path.name}")["global"]["modifiedBy"]
+            except Exception:
+                return None
+            self._by[path.name] = cached = (mtime, by)
+        return cached[1]
+
     def activity(self, limit=50) -> list[dict]:
-        """Newest first, from every PC that has hosted."""
+        """Newest first, from every PC that has hosted. Entries this PC saw before stay, marked "removed", if a list
+        loses them; a list last changed by a PC other than its owner gets a warning entry."""
         # shortcut: not mirrored to the backup folder, so groups never online together don't see it; add if asked.
-        entries = [e for p in self.baton_file.parent.glob("activity-*.jsonl") for e in self.read_activity_file(p)]
-        return sorted(entries, key=lambda e: e.get("t", 0), reverse=True)[:limit]
+        seen = self._read_json(self._seen_file) or {}
+        try:
+            names = {i[:7]: n for i, n in self.st.devices().items()}
+        except Exception:
+            names = {}
+        files = {p.name: p for p in self.baton_file.parent.glob("activity-*.jsonl")}
+        out, new_seen = [], {}
+        for name in sorted(files.keys() | seen.keys()):
+            current = self.read_activity_file(files[name]) if name in files else []
+            keys = {(e["at"], e["text"]) for e in current}
+            oldest = min((e["t"] for e in current), default=None)
+            removed = [{**e, "removed": True} for e in seen.get(name, [])
+                       if (e["at"], e["text"]) not in keys and (oldest is None or e["t"] >= oldest)]  # older = trimmed
+            out += current + removed
+            new_seen[name] = (current + [{k: v for k, v in e.items() if k != "removed"} for e in removed])[-KEEP_ACTIVITY:]
+            owner = name.removeprefix("activity-").removesuffix(".jsonl")
+            by = self._modified_by(files[name]) if name in files else None
+            if by and by != owner:
+                out.append({"t": files[name].stat().st_mtime, "host": "",
+                            "text": f"⚠ {names.get(owner, owner)}'s activity list was last changed by "
+                                    f"{names.get(by, 'another PC')} ({by})."})
+        if new_seen != seen:
+            self._write_json(self._seen_file, new_seen)
+        return sorted(out, key=lambda e: e.get("t", 0), reverse=True)[:limit]
 
     def _backup_version(self, baton, need_files) -> int:
         """Version available in the backup folder, checked only when our own copy is behind."""
@@ -512,12 +741,18 @@ class Group:
         self.write_baton({**baton, "holder": self.st.my_id, "holder_name": player,
                           "address": address.strip(), "heartbeat": time.time(), "since": time.time()})
         self._skip_old_log()  # only report what happens from now on
+        self._marks_file.unlink(missing_ok=True)
+        self.watch_offline_edits(player)
 
     def heartbeat(self) -> None:
         baton = self.read_baton()
         if baton and baton.get("holder") == self.st.my_id:
-            self.write_baton({**baton, "heartbeat": time.time()})
-            self.record_activity(baton.get("holder_name", "?"))
+            now = time.time()
+            gap = now - baton.get("heartbeat", now)
+            if gap > 120:  # WorldBaton was closed (or the PC asleep) mid-session; its logs are read again now
+                self.add_activity(baton.get("holder_name", "?"), [(f"gap-{baton.get('heartbeat')}",
+                                  f"⚠ WorldBaton wasn't running for {gap / 60:.0f} min while hosting.")])
+            self.write_baton({**baton, "heartbeat": now})
 
     def stop_hosting(self, player) -> str:
         """Share the session. Returns a warning for the player, or '' if all went well."""
@@ -529,7 +764,8 @@ class Group:
                              "Use 'Discard my session' to get their world, or ask the group what to keep.")
         try:
             self.record_activity(player)  # the last lines, before the session is shared
-        except OSError:
+            self.report_offline_edits(player)
+        except Exception:
             pass  # never block sharing the world over the activity log
         v = baton.get("version", 0) + 1
         self._write_version(v)
