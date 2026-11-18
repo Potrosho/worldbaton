@@ -18,7 +18,6 @@ from .tray import Tray
 from .syncthing import Syncthing
 
 CONFIG = APP_DIR / "config.json"
-SQUID_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "SquidServers"
 REFRESH_MS = 3000
 
 
@@ -247,12 +246,22 @@ class App:
                       foreground="#a0a0a0").pack(pady=(0, 16))
             ttk.Button(self.body, text="Create a group from my server", command=self.create_group).pack(fill="x", pady=4)
             ttk.Button(self.body, text="Join a friend's group", command=self.join_group).pack(fill="x", pady=4)
-            if not SQUID_DIR.exists():  # SquidServers keeps its servers here once it's installed and used
-                ttk.Label(self.body, text="SquidServers doesn't seem to be on this PC. You can still join a group and "
-                                          "get the world, but to host you'll need SquidServers.", wraplength=420,
-                          justify="center", foreground="#ffd479").pack(pady=(16, 6))
-                ttk.Button(self.body, text="Get SquidServers",
-                           command=lambda: webbrowser.open("https://squidservers.com")).pack()
+            if not self.cfg.get("has_squidservers") and not tools.squid_installed():
+                hint = ttk.Frame(self.body)
+                hint.pack(pady=(16, 0))
+                ttk.Label(hint, text="WorldBaton couldn't find SquidServers on this PC. You can still join a group and "
+                                     "get the world, but to host you'll need SquidServers.", wraplength=420,
+                          justify="center", foreground="#ffd479").pack(pady=(0, 6))
+                buttons = ttk.Frame(hint)
+                buttons.pack()
+                ttk.Button(buttons, text="Get SquidServers",
+                           command=lambda: webbrowser.open("https://squidservers.com")).pack(side="left", padx=(0, 6))
+
+                def have_it():  # e.g. a portable copy WorldBaton can't detect
+                    self.cfg["has_squidservers"] = True
+                    save_config(self.cfg)
+                    hint.destroy()
+                ttk.Button(buttons, text="I already have it", command=have_it).pack(side="left")
 
     def show_group(self):
         b = self.body
@@ -458,7 +467,7 @@ class App:
 
     # --- actions -----------------------------------------------------------------
     def create_group(self):
-        start = SQUID_DIR if SQUID_DIR.exists() else Path.home()
+        start = tools.squid_servers_dir() if tools.squid_servers_dir().is_dir() else Path.home()
         path = filedialog.askdirectory(title="Pick your server folder", initialdir=start, mustexist=True)
         if not path:
             return
@@ -481,7 +490,8 @@ class App:
             return
         try:
             invite = core.decode_invite(code)
-            parent = SQUID_DIR if SQUID_DIR.exists() else Path.home() / "WorldBaton servers"
+            squid = tools.squid_servers_dir()
+            parent = squid if squid.is_dir() else Path.home() / "WorldBaton servers"
             self.group = core.Group.join(self.st, APP_DIR, invite, parent)
         except Exception as e:
             messagebox.showerror("WorldBaton", str(e))
@@ -572,7 +582,7 @@ class App:
                "Its own start files, RAM setting and logs are kept.")
         if not messagebox.askokcancel("Change server folder", msg):
             return
-        start = SQUID_DIR if SQUID_DIR.exists() else Path.home()
+        start = tools.squid_servers_dir() if tools.squid_servers_dir().is_dir() else Path.home()
         path = filedialog.askdirectory(title="Pick the server folder SquidServers made", initialdir=start, mustexist=True)
         if not path:
             return

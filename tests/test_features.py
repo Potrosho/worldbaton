@@ -110,6 +110,33 @@ class BeforeHosting(unittest.TestCase):
             self.assertEqual(tools.prehost_problems(Path(d)), [])
 
 
+class FindingSquidServers(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        env = {"APPDATA": str(self.tmp / "Roaming"), "LOCALAPPDATA": str(self.tmp / "Local")}
+        self.env = mock.patch.dict("os.environ", env)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_not_installed(self):
+        with mock.patch.object(tools, "_squid_registered", return_value=False):
+            self.assertFalse(tools.squid_installed())
+        self.assertEqual(tools.squid_servers_dir(), self.tmp / "Local" / "SquidServers")
+
+    def test_installed_somewhere_else(self):
+        with mock.patch.object(tools, "_squid_registered", return_value=True):  # in Windows' installed-apps list
+            self.assertTrue(tools.squid_installed())
+
+    def test_servers_in_a_custom_folder(self):
+        data = self.tmp / "Roaming" / "squidservers"
+        data.mkdir(parents=True)
+        (data / "user-preferences.json").write_text('{"defaultServerDirectory": "D:\\\\Games\\\\Servers"}')
+        self.assertEqual(tools.squid_servers_dir(), Path("D:/Games/Servers"))
+        (data / "servers.json").write_text("[]")  # it has been set up, even with no servers folder yet
+        with mock.patch.object(tools, "_squid_registered", return_value=False):
+            self.assertTrue(tools.squid_installed())
+
+
 class Discord(unittest.TestCase):
     def test_only_webhook_links(self):
         self.assertTrue(tools.valid_webhook("https://discord.com/api/webhooks/123456/abc-DEF_9"))

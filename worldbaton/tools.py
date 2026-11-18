@@ -16,6 +16,51 @@ DISCORD = re.compile(r"^https://(?:\w+\.)?discord(?:app)?\.com/api/webhooks/\d+/
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
+# --- SquidServers on this PC (read-only; WorldBaton never changes SquidServers' files) -------------------------
+def _squid_data() -> Path:
+    return Path(os.environ.get("APPDATA", Path.home())) / "squidservers"
+
+
+def _squid_registered() -> bool:
+    """True if Windows' installed-apps list has SquidServers, wherever it was installed."""
+    if os.name != "nt":
+        return False
+    import winreg
+    places = [(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+              (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+              (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall")]
+    for hive, path in places:
+        try:
+            with winreg.OpenKey(hive, path) as apps:
+                for i in range(winreg.QueryInfoKey(apps)[0]):
+                    try:
+                        with winreg.OpenKey(apps, winreg.EnumKey(apps, i)) as app:
+                            if "squidservers" in str(winreg.QueryValueEx(app, "DisplayName")[0]).replace(" ", "").lower():
+                                return True
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return False
+
+
+def squid_servers_dir() -> Path:
+    """Where SquidServers makes new servers: its "default server directory" setting, else its usual folder."""
+    try:
+        prefs = json.loads((_squid_data() / "user-preferences.json").read_text(encoding="utf-8"))
+        custom = prefs.get("defaultServerDirectory")
+        if isinstance(custom, str) and custom.strip():
+            return Path(custom)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "SquidServers"
+
+
+def squid_installed() -> bool:
+    """Best guess whether SquidServers is on this PC: installed anywhere, its settings, or its servers folder."""
+    return _squid_registered() or (_squid_data() / "servers.json").exists() or squid_servers_dir().is_dir()
+
+
 # --- your own Minecraft's mods ------------------------------------------------------------------------
 def sync_game_mods(server_mods: Path, game_mods: Path, managed: list[str]) -> tuple[list[str], list[str], list[str]]:
     """Make the game's mods folder have the server's mods. Only touches files WorldBaton put there before

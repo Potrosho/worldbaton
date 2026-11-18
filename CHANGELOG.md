@@ -18,7 +18,8 @@ update, and as the notes of each GitHub release. Every release needs a section h
 - Before you host, WorldBaton checks for a nearly full drive and for a SquidServers server that was set up with a
   different loader version than the group's.
 - Clearer that WorldBaton is an add-on for SquidServers, not a replacement: SquidServers runs the server, and
-  WorldBaton passes the world and the turn to host. If SquidServers isn't on your PC, WorldBaton says so.
+  WorldBaton passes the world and the turn to host. If SquidServers isn't on your PC, WorldBaton says so
+  (it finds SquidServers wherever it's installed, and its server folder even if you moved it).
 - New look: WorldBaton has its own logo, on the app, the taskbar and the window.
 - What's new: this list now lives in its own tab, and WorldBaton shows what changed once after each update.
 - Update prompts now say what the new version changes before you decide.
