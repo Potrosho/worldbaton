@@ -21,6 +21,9 @@ jobs:
       - name: Check the tag matches the app version
         run: python -c "import sys, worldbaton; v = 'v' + worldbaton.__version__; sys.exit(0 if v == '${{ github.ref_name }}' else f'Tag ${{ github.ref_name }} does not match version {v} in worldbaton/__init__.py')"
 
+      - name: Install sv-ttk (window theme)
+        run: pip install sv-ttk
+
       - name: Get Syncthing
         run: python scripts/get_syncthing.py
 
@@ -29,7 +32,7 @@ jobs:
 
       - name: Build
         run: |
-          pip install pyinstaller
+          pip install pyinstaller sv-ttk
           ./build.ps1
 
       - name: Publish release

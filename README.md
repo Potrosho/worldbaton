@@ -74,6 +74,10 @@ If your PC crashes while hosting, reopen WorldBaton: as long as nobody took over
 ## Development
 
 ```bash
+pip install sv-ttk
+```
+
+```bash
 python scripts/get_syncthing.py
 ```
 

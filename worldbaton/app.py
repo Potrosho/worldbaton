@@ -1,10 +1,13 @@
 """WorldBaton window (tkinter)."""
+import ctypes
 import json
 import os
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
+
+import sv_ttk
 
 from . import __version__, core, updater
 from .syncthing import Syncthing
@@ -25,6 +28,16 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG.write_text(json.dumps(cfg, indent=2))
+
+
+def dark_title_bar(win) -> None:
+    """Make the Windows title bar dark to match the theme (Windows 10 20H1+ and 11; ignored elsewhere)."""
+    try:
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(1)), 4)
+    except Exception:
+        pass
 
 
 class App:
@@ -121,7 +134,7 @@ class App:
         text.config(state="disabled")
         foot = ttk.Frame(g)
         foot.pack(side="bottom", fill="x", pady=(8, 0))
-        ttk.Label(foot, text=f"WorldBaton {__version__}", foreground="#555").pack(side="left")
+        ttk.Label(foot, text=f"WorldBaton {__version__}", foreground="#a0a0a0").pack(side="left")
         ttk.Button(foot, text="Check for updates", command=lambda: self.check_updates(manual=True)).pack(side="right")
         bar.pack(side="right", fill="y")
         text.pack(side="left", fill="both", expand=True)
@@ -150,9 +163,9 @@ class App:
         addr_row.pack(anchor="w", fill="x")
         self.address = ttk.Entry(addr_row, width=40)
         self.copy_btn = ttk.Button(addr_row, text="Copy address", command=lambda: self.copy(self.address.get()))
-        self.reason = ttk.Label(b, wraplength=440, foreground="#555")
+        self.reason = ttk.Label(b, wraplength=440, foreground="#a0a0a0")
         self.reason.pack(anchor="w", pady=(4, 8))
-        self.warning = ttk.Label(b, wraplength=440, foreground="#b00020")
+        self.warning = ttk.Label(b, wraplength=440, foreground="#ff8080")
         self.warning.pack(anchor="w")
 
         ttk.Label(b, text="Friends", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 0))
@@ -173,7 +186,7 @@ class App:
         ttk.Button(row2, text="Backup folder…", command=self.pick_backup).pack(side="left", padx=(0, 6))
         ttk.Button(row2, text="Change server folder…", command=self.change_folder).pack(side="left", padx=(0, 6))
         ttk.Button(row2, text="My address…", command=self.ask_address).pack(side="left")
-        self.backup_label = ttk.Label(b, wraplength=440, foreground="#555")
+        self.backup_label = ttk.Label(b, wraplength=440, foreground="#a0a0a0")
         self.backup_label.pack(anchor="w", pady=(8, 0))
         self.show_backup()
         self.tick()
@@ -412,6 +425,7 @@ class App:
     def code_dialog(self, label, code):
         win = tk.Toplevel(self.root)
         win.title("WorldBaton")
+        dark_title_bar(win)
         ttk.Label(win, text=label, wraplength=420).pack(anchor="w", padx=12, pady=(12, 4))
         e = ttk.Entry(win, width=60)
         e.insert(0, code)
@@ -505,6 +519,9 @@ class App:
 
 def main():
     root = tk.Tk()
+    sv_ttk.set_theme("dark", root)
+    root.tk.call("configure_colors")  # Tk 9 doesn't fire the theme's <<ThemeChanged>> hook, leaving pages light
+    dark_title_bar(root)
     App(root)
     root.mainloop()
 
