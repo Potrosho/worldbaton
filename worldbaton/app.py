@@ -3,6 +3,7 @@ import ctypes
 import json
 import os
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -115,6 +116,11 @@ class App:
         ("p", "3. When you're done, stop the server in SquidServers FIRST, then press Stop hosting."),
         ("p", "4. Keep WorldBaton open until your friends show 100% synced."),
         ("p", "• Only start the server when WorldBaton says you're the host. Anything played otherwise is undone."),
+        ("h", "Mods and fair play"),
+        ("p", "• When the host adds or removes a mod, everyone sees it under My group. Put the same mod in your own "
+              "Minecraft's mods folder too, or you can't join."),
+        ("p", "• Admin commands (op, gamemode, give, tp…) used on the server are listed under Host activity for the whole "
+              "group, and so are changes to who is an operator."),
         ("h", "Rarely online at the same time?"),
         ("p", "• Share a Google Drive, OneDrive or Dropbox folder with the group and install that drive's desktop app."),
         ("p", "• Press Backup folder… and pick your copy of that shared folder. Everyone does this on their own PC."),
@@ -167,10 +173,23 @@ class App:
         self.reason.pack(anchor="w", pady=(4, 8))
         self.warning = ttk.Label(b, wraplength=440, foreground="#ff8080")
         self.warning.pack(anchor="w")
+        self.changes_box = ttk.Frame(b)  # stays packed (empty when nothing changed) so it keeps its place
+        self.changes_box.pack(anchor="w", fill="x")
+        self.changes = ttk.Label(self.changes_box, wraplength=440, foreground="#ffd479")
+        self.changes_row = ttk.Frame(self.changes_box)
+        ttk.Button(self.changes_row, text="Got it", command=self.ack_changes).pack(side="left", padx=(0, 6))
+        ttk.Button(self.changes_row, text="Open server mods folder",
+                   command=lambda: os.startfile(self.group.world_path / "mods")).pack(side="left")
 
         ttk.Label(b, text="Friends", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 0))
-        self.members = tk.Text(b, height=6, width=56, relief="flat", background=self.root.cget("background"))
+        self.members = tk.Text(b, height=6, width=56, relief="flat", background=self.root.cget("background"), font=("Segoe UI", 10))
         self.members.pack(anchor="w", fill="x")
+
+        ttk.Label(b, text="Host activity (admin commands)", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 0))
+        self.activity = tk.Text(b, height=5, width=56, relief="flat", wrap="word", background=self.root.cget("background"),
+                                font=("Segoe UI", 10))
+        self.activity.pack(anchor="w", fill="x")
+        self.activity_shown = None
 
         row = ttk.Frame(b)
         row.pack(fill="x", pady=(12, 0))
@@ -243,11 +262,55 @@ class App:
         if not s["members"]:
             self.members.insert("end", "No friends yet. Press 'Invite a friend'.")
         self.members.config(state="disabled")
+        self.show_changes(s)
+        self.show_activity()
 
         self.host_btn.config(state="normal" if s["can_host"] else "disabled")
         self.stop_btn.config(state="normal" if s["me_hosting"] else "disabled")
         self.discard_btn.config(state="normal" if s["lost_baton"] else "disabled")
         self.root.after(REFRESH_MS, self.tick)
+
+    def show_changes(self, s):
+        """Mods/operators that changed since this player last pressed Got it."""
+        self.snapshot = None
+        if s["need_files"] or not s["local_version"]:  # still downloading: wait for the full picture
+            changes = []
+        else:
+            self.snapshot = core.server_snapshot(self.group.world_path)
+            if "seen" not in self.group.info:  # first look (or just joined and synced): nothing is "new"
+                self.ack_changes()
+            changes = core.snapshot_changes(self.group.info["seen"], self.snapshot)
+        if not changes:
+            self.changes.pack_forget()
+            self.changes_row.pack_forget()
+            return
+        more = f"\n…and {len(changes) - 8} more" if len(changes) > 8 else ""
+        self.changes.config(text="Changed since you last looked:\n" + "\n".join(changes[:8]) + more +
+                            ("\nAdd/remove the same mods in your own Minecraft to keep joining."
+                             if any("mod" in c for c in changes) else ""))
+        self.changes.pack(anchor="w", pady=(8, 0))
+        self.changes_row.pack(anchor="w", pady=(4, 0))
+
+    def ack_changes(self):
+        if self.snapshot is not None:
+            self.group.info["seen"] = self.snapshot
+            save_config(self.cfg)
+            self.changes.pack_forget()
+            self.changes_row.pack_forget()
+
+    def show_activity(self):
+        entries = self.group.activity()
+        if entries == self.activity_shown:  # don't reset the scroll position every refresh
+            return
+        self.activity_shown = entries
+        self.activity.config(state="normal")
+        self.activity.delete("1.0", "end")
+        for e in entries:
+            when = time.strftime("%d %b %H:%M", time.localtime(e.get("t", 0)))
+            self.activity.insert("end", f"{when}  hosted by {e.get('host', '?')} — {e.get('text', '')}\n")
+        if not entries:
+            self.activity.insert("end", "Nothing yet. Commands like /op, /gamemode and /give show up here.")
+        self.activity.config(state="disabled")
 
     def beat(self):
         if self.group and not self.busy:

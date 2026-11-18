@@ -56,6 +56,11 @@ If your PC crashes while hosting, reopen WorldBaton: as long as nobody took over
   session is shared once you press *Stop hosting*.
 - You can only host when your copy matches the newest version. If the host's PC dies,
   friends can take over after 5 minutes without a heartbeat (that session is lost).
+- Mods and operators: when the server's `mods` folder or `ops.json` changes, everyone sees what changed
+  (install the same mods in your own Minecraft to keep joining).
+- Host activity: while you host, admin commands from the server log (op, gamemode, give, tp, ban…) are
+  shared with the group. It catches casual abuse, not a determined cheater: the host controls their own
+  PC and could turn logging off or edit files. Operator changes are seen either way, since `ops.json` syncs.
 - Logs, crash reports, caches and SquidServers' per-PC files (`squidservers/`,
   `.mc_server_state.json`) are not synced. Each person's tunnel stays their own.
 

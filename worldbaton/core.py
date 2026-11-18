@@ -4,6 +4,7 @@ Two Syncthing folders per group:
   world  - the server folder. Only the last host sends; everyone else is receive-only.
            Paused on the host while hosting, so friends never get half-saved files.
   baton  - one small baton.json everyone can write: who is hosting, their address, the world version.
+           Also each PC's activity-<id>.jsonl: admin commands seen in the server log while it hosted.
 
 Optional backup folder (e.g. a shared Google Drive/OneDrive folder) for groups that are never
 online at the same time: each finished session is zipped there, and the baton is mirrored there.
@@ -13,6 +14,7 @@ import ctypes
 import fnmatch
 import json
 import os
+import re
 import secrets
 import shutil
 import time
@@ -22,6 +24,18 @@ from pathlib import Path
 STALE_AFTER = 300      # seconds without a heartbeat before others may take over
 HEARTBEAT_EVERY = 30
 VERSION_FILE = ".worldbaton-version"
+KEEP_ACTIVITY = 500    # admin-log entries kept per PC
+
+# Server log lines: NeoForge "[20Sep2026 11:57:08.841] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: msg",
+# vanilla "[11:57:08] [Server thread/INFO]: msg".
+LOG_LINE = re.compile(r"^\[([^\]]+)\] \[Server thread/INFO\](?: \[[^\]]*\])?: (.*)$")
+PLAYER_COMMAND = re.compile(r"^\[(\w{1,16}): (.*)\]$")  # logAdminCommands: "[Potrosh0: Gave 34 [Diamond] to X]"
+# shortcut: console commands have no "who" marker, so only these common admin results are caught; add more as found.
+CONSOLE_COMMAND = re.compile(
+    r"^(Made \S+ (a|no longer a) server operator|Set \S+'s game mode|Set own game mode|Gave |Teleported |"
+    r"Gamerule |Set the (time|weather|difficulty|world spawn)|Set spawn point|Banned |Unbanned |Kicked |Killed |"
+    r"Summoned |Applied effect|Removed \d+ item|Cleared the inventory|Enchanting succeeded|Added .* to the whitelist|"
+    r"Removed .* from the whitelist|Whitelist is now)")
 
 # Per-PC or throwaway files. SquidServers keeps its own state/tunnel data in these too,
 # and writes start scripts with this PC's Java path and RAM setting.
@@ -156,6 +170,38 @@ def server_running(world_path: Path) -> bool:
     return state.get("status") == "online" and isinstance(state.get("pid"), int) and pid_alive(state["pid"])
 
 
+def admin_line(line: str) -> tuple[str, str] | None:
+    """(log time, what happened) if a server log line is an admin command, else None."""
+    m = LOG_LINE.match(line.rstrip("\r\n"))
+    if not m:
+        return None
+    at, msg = m.groups()
+    if p := PLAYER_COMMAND.match(msg):
+        return at, f"{p[1]}: {p[2]}"
+    if CONSOLE_COMMAND.match(msg):
+        return at, f"Console: {msg}"
+    return None
+
+
+def server_snapshot(world_path: Path) -> dict:
+    """Mods and operators in a server folder, to tell players when they change."""
+    world_path = Path(world_path)
+    try:
+        ops = sorted({o["name"] for o in json.loads((world_path / "ops.json").read_text())})
+    except (OSError, ValueError, KeyError, TypeError):
+        ops = []
+    return {"mods": sorted(p.name for p in (world_path / "mods").glob("*.jar")), "ops": ops}
+
+
+def snapshot_changes(old: dict, new: dict) -> list[str]:
+    old_mods, new_mods = set(old.get("mods", [])), set(new["mods"])
+    old_ops, new_ops = set(old.get("ops", [])), set(new["ops"])
+    return ([f"New mod: {m}" for m in sorted(new_mods - old_mods)] +
+            [f"Mod removed: {m}" for m in sorted(old_mods - new_mods)] +
+            [f"Now an operator: {o}" for o in sorted(new_ops - old_ops)] +
+            [f"No longer an operator: {o}" for o in sorted(old_ops - new_ops)])
+
+
 def replace_synced_files(src: Path, dest: Path, move: bool) -> None:
     """Make dest's synced files exactly src's. Per-PC files in dest (see SKIP) are left alone."""
     src, dest = Path(src), Path(dest)
@@ -177,6 +223,7 @@ class Group:
         self.world_path = Path(info["world_path"])
         self.app_dir = Path(app_dir)
         self.baton_file = self.app_dir / f"baton-{self.baton_id}" / "baton.json"
+        self._log_at = None  # (latest.log creation time, bytes already read)
 
     @property
     def backup_dir(self) -> Path | None:
@@ -386,6 +433,58 @@ class Group:
     def conflicts(self) -> list[str]:
         return [p.name for p in self.baton_file.parent.glob("*.sync-conflict-*")]
 
+    # admin activity: each PC writes only its own file, so the baton folder never gets conflicts
+    @property
+    def activity_file(self) -> Path:
+        return self.baton_file.parent / f"activity-{self.st.my_id[:7]}.jsonl"
+
+    def _new_log_lines(self) -> list[str]:
+        log = self.world_path / "logs" / "latest.log"
+        try:
+            info = log.stat()
+        except OSError:
+            return []
+        born = getattr(info, "st_birthtime", info.st_ctime)
+        seen_born, pos = self._log_at or (None, 0)
+        if born != seen_born or info.st_size < pos:
+            pos = 0  # server restarted: a new latest.log
+        with open(log, "rb") as f:
+            f.seek(pos)
+            data = f.read()
+        end = data.rfind(b"\n") + 1  # leave a half-written last line for next time
+        self._log_at = (born, pos + end)
+        return data[:end].decode("utf-8", "replace").splitlines()
+
+    def _skip_old_log(self) -> None:
+        self._log_at = None
+        self._new_log_lines()
+
+    def record_activity(self, player) -> None:
+        found = [a for a in map(admin_line, self._new_log_lines()) if a]
+        if not found:
+            return
+        entries = self.read_activity_file(self.activity_file)
+        seen = {(e["at"], e["text"]) for e in entries}  # after a WorldBaton restart the log is read again
+        now = time.time()
+        entries += [{"t": now, "at": at, "host": player, "text": text} for at, text in found if (at, text) not in seen]
+        tmp = self.activity_file.with_suffix(".tmp")
+        tmp.write_text("".join(json.dumps(e) + "\n" for e in entries[-KEEP_ACTIVITY:]), encoding="utf-8")
+        os.replace(tmp, self.activity_file)
+        self.st.scan(self.baton_id)
+
+    @staticmethod
+    def read_activity_file(path: Path) -> list[dict]:
+        try:
+            return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except (OSError, ValueError):
+            return []
+
+    def activity(self, limit=50) -> list[dict]:
+        """Newest first, from every PC that has hosted."""
+        # shortcut: not mirrored to the backup folder, so groups never online together don't see it; add if asked.
+        entries = [e for p in self.baton_file.parent.glob("activity-*.jsonl") for e in self.read_activity_file(p)]
+        return sorted(entries, key=lambda e: e.get("t", 0), reverse=True)[:limit]
+
     def _backup_version(self, baton, need_files) -> int:
         """Version available in the backup folder, checked only when our own copy is behind."""
         v = (baton or {}).get("version", 0)
@@ -412,11 +511,13 @@ class Group:
                 raise ValueError(f"Couldn't load the backup: {e}")
         self.write_baton({**baton, "holder": self.st.my_id, "holder_name": player,
                           "address": address.strip(), "heartbeat": time.time(), "since": time.time()})
+        self._skip_old_log()  # only report what happens from now on
 
     def heartbeat(self) -> None:
         baton = self.read_baton()
         if baton and baton.get("holder") == self.st.my_id:
             self.write_baton({**baton, "heartbeat": time.time()})
+            self.record_activity(baton.get("holder_name", "?"))
 
     def stop_hosting(self, player) -> str:
         """Share the session. Returns a warning for the player, or '' if all went well."""
@@ -426,6 +527,10 @@ class Group:
         if not baton or baton.get("holder") != self.st.my_id:
             raise ValueError("Someone else took over while you were hosting, so your session wasn't shared. "
                              "Use 'Discard my session' to get their world, or ask the group what to keep.")
+        try:
+            self.record_activity(player)  # the last lines, before the session is shared
+        except OSError:
+            pass  # never block sharing the world over the activity log
         v = baton.get("version", 0) + 1
         self._write_version(v)
         warning = ""

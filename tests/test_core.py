@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from worldbaton import core
 
@@ -60,6 +63,62 @@ class Rules(unittest.TestCase):
     def test_safe_folder_name(self):
         self.assertEqual(core.safe_folder_name('a<b>:c?.'), "abc")
         self.assertEqual(core.safe_folder_name("..."), "WorldBaton world")
+
+
+NEO = "[20Sep2026 12:09:54.627] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: "
+
+
+class FakeSyncthing:
+    my_id = "ABCDEFG-HIJ"
+
+    def scan(self, folder_id):
+        pass
+
+
+class Watching(unittest.TestCase):
+    def test_admin_lines(self):
+        self.assertEqual(core.admin_line(NEO + "[Potrosh0: Gave 34 [Diamond] to ThebestWill686]\n"),
+                         ("20Sep2026 12:09:54.627", "Potrosh0: Gave 34 [Diamond] to ThebestWill686"))
+        self.assertEqual(core.admin_line(NEO + "Made Potrosh0 a server operator")[1], "Console: Made Potrosh0 a server operator")
+        self.assertEqual(core.admin_line("[11:57:08] [Server thread/INFO]: [Sam: Set own game mode to Creative Mode]")[1],
+                         "Sam: Set own game mode to Creative Mode")
+        for ignored in (NEO + "Potrosh0 joined the game", NEO + "<Sam> [Sam: Gave 1 [Diamond] to Sam]",
+                        NEO + "[Server] hi", "[20Sep2026 12:09:54.627] [Worker/INFO] [x/]: Gave 1 thing", "garbage"):
+            self.assertIsNone(core.admin_line(ignored), ignored)
+
+    def test_snapshot_changes(self):
+        with tempfile.TemporaryDirectory() as d:
+            w = Path(d)
+            self.assertEqual(core.server_snapshot(w), {"mods": [], "ops": []})
+            (w / "mods").mkdir()
+            (w / "mods" / "create.jar").write_text("")
+            (w / "mods" / "notes.txt").write_text("")
+            (w / "ops.json").write_text(json.dumps([{"name": "Sam", "level": 4}]))
+            snap = core.server_snapshot(w)
+        self.assertEqual(snap, {"mods": ["create.jar"], "ops": ["Sam"]})
+        self.assertEqual(core.snapshot_changes({"mods": ["jei.jar"], "ops": []}, snap),
+                         ["New mod: create.jar", "Mod removed: jei.jar", "Now an operator: Sam"])
+        self.assertEqual(core.snapshot_changes(snap, snap), [])
+
+    def test_record_activity_only_new_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "world" / "logs").mkdir(parents=True)
+            log = d / "world" / "logs" / "latest.log"
+            log.write_text(NEO + "[Sam: Gave 1 [Diamond] to Sam]\n")
+            g = core.Group(FakeSyncthing(), {"world_id": "w", "baton_id": "b", "world_path": str(d / "world")}, d)
+            g.baton_file.parent.mkdir(parents=True)
+            g._skip_old_log()  # what start_hosting does: earlier lines aren't this session
+            with open(log, "a") as f:
+                f.write(NEO + "Made Sam a server operator\n" + NEO + "Sam joined the game\n" + NEO + "[Sam: Kil")
+            g.record_activity("Sam")
+            self.assertEqual([e["text"] for e in g.activity()], ["Console: Made Sam a server operator"])
+            with open(log, "a") as f:
+                f.write("led Bob]\n")  # the half-written line is picked up once finished
+            g._log_at = None  # WorldBaton restarted mid-session: rereads the log without duplicates
+            g.record_activity("Sam")
+            texts = sorted(e["text"] for e in g.activity())
+        self.assertEqual(texts, ["Console: Made Sam a server operator", "Sam: Gave 1 [Diamond] to Sam", "Sam: Killed Bob"])
 
 
 if __name__ == "__main__":
