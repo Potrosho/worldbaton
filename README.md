@@ -4,13 +4,17 @@
 
 Share one Minecraft server with your friends. Whoever is online can host it.
 
+**WorldBaton is an add-on for [SquidServers](https://squidservers.com), not a replacement.** It doesn't run
+Minecraft servers: everyone who hosts still starts and stops the server in SquidServers, which also gives them the
+address friends join with. WorldBaton handles the sharing part: it passes the world and the turn to host between you.
+
 WorldBaton keeps a copy of your server folder on every friend's PC and passes the
 "baton" (the right to host) between you, so only one person runs the world at a time
 and nobody loses progress. No cloud, no accounts, no monthly cost: your PCs sync
 directly with each other using [Syncthing](https://syncthing.net).
 
-Works with [SquidServers](https://squidservers.com) server folders and plain server
-folders. **WorldBaton is not made by or affiliated with SquidServers / Aqura LLC**, and
+Made for SquidServers server folders; it also works with a plain server folder if you start that server
+yourself. **WorldBaton is not made by or affiliated with SquidServers / Aqura LLC**, and
 it doesn't modify their app: it only syncs your server folder.
 
 > **Only use WorldBaton with people you would trust with full access to your computer.**
@@ -93,6 +97,8 @@ If your PC crashes while hosting, reopen WorldBaton: as long as nobody took over
 
 ## Limits (for now)
 
+- WorldBaton doesn't host servers itself; you need SquidServers (or to start the server yourself). A basic
+  built-in way to run the server may come in a future update.
 - Windows only, one group per PC.
 - Without a backup folder, two PCs must be online at the same time to pass the world on.
 - WorldBaton can't tell when a cloud drive has finished uploading; the host has to check.

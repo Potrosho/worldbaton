@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import time
+import webbrowser
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -116,6 +117,9 @@ class App:
     # --- screens -----------------------------------------------------------------
     GUIDE = [
         ("h", "Before you start"),
+        ("p", "• WorldBaton is an add-on for SquidServers, not a replacement: it doesn't run the server. You start "
+              "and stop the server in SquidServers, which also gives you the address friends join with. WorldBaton "
+              "passes the world and the turn to host between you."),
         ("p", "• Only use WorldBaton with people you'd trust with full access to your computer. Anyone in your group "
               "can put mods and files on your PC, and mods are programs that run when you host or play with them."),
         ("p", "• Everyone who wants to take turns hosting needs WorldBaton and SquidServers. "
@@ -237,9 +241,18 @@ class App:
         else:
             ttk.Label(self.body, text=f"Hi {self.cfg['player']}!", font=("Segoe UI", 14, "bold")).pack(pady=(0, 8))
             ttk.Label(self.body, text="Share one Minecraft server with friends.\nWhoever is online can host it.",
-                      justify="center").pack(pady=(0, 16))
+                      justify="center").pack(pady=(0, 6))
+            ttk.Label(self.body, text="An add-on for SquidServers: SquidServers runs the server, WorldBaton passes "
+                                      "the world and the turn to host between you.", wraplength=420, justify="center",
+                      foreground="#a0a0a0").pack(pady=(0, 16))
             ttk.Button(self.body, text="Create a group from my server", command=self.create_group).pack(fill="x", pady=4)
             ttk.Button(self.body, text="Join a friend's group", command=self.join_group).pack(fill="x", pady=4)
+            if not SQUID_DIR.exists():  # SquidServers keeps its servers here once it's installed and used
+                ttk.Label(self.body, text="SquidServers doesn't seem to be on this PC. You can still join a group and "
+                                          "get the world, but to host you'll need SquidServers.", wraplength=420,
+                          justify="center", foreground="#ffd479").pack(pady=(16, 6))
+                ttk.Button(self.body, text="Get SquidServers",
+                           command=lambda: webbrowser.open("https://squidservers.com")).pack()
 
     def show_group(self):
         b = self.body
