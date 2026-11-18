@@ -1,0 +1,38 @@
+# Push a tag like v0.2.0 (matching worldbaton/__init__.py) to test, build and publish WorldBaton.exe.
+# Everyone's WorldBaton offers that release as an update on its next start.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check the tag matches the app version
+        run: python -c "import sys, worldbaton; v = 'v' + worldbaton.__version__; sys.exit(0 if v == '${{ github.ref_name }}' else f'Tag ${{ github.ref_name }} does not match version {v} in worldbaton/__init__.py')"
+
+      - name: Get Syncthing
+        run: python scripts/get_syncthing.py
+
+      - name: Test
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Build
+        run: |
+          pip install pyinstaller
+          ./build.ps1
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/WorldBaton.exe --title "WorldBaton ${{ github.ref_name }}" --generate-notes
