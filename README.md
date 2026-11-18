@@ -44,6 +44,8 @@ Friends see who is hosting and the address to join with.
 
 ### Also in the app
 
+- **Several groups:** join or create as many as you like and switch between them; each keeps
+  syncing in the background and has its own tunnel address. *Leave this group* keeps the files.
 - **Notifications and tray:** told when someone starts hosting, when their server is up, when it's your turn
   and when the server changes. WorldBaton can stay in the tray and start with Windows (Settings).
 - **Ask to host next** while someone else hosts; they're told, and you're told when it's your turn.
@@ -99,7 +101,7 @@ If your PC crashes while hosting, reopen WorldBaton: as long as nobody took over
 
 - WorldBaton doesn't host servers itself; you need SquidServers (or to start the server yourself). A basic
   built-in way to run the server may come in a future update.
-- Windows only, one group per PC.
+- Windows only.
 - Without a backup folder, two PCs must be online at the same time to pass the world on.
 - WorldBaton can't tell when a cloud drive has finished uploading; the host has to check.
 - Anyone in the group can host and change the world, so only invite people you trust.

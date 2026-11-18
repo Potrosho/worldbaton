@@ -359,6 +359,15 @@ def describe_edits(before: dict, after: dict, world_path: Path) -> str | None:
     return f"⚠ Files changed while the server was off, not by the game: {', '.join(shown)}{more}"
 
 
+def check_not_taken(path: Path, taken) -> None:
+    """Refuse a server folder that another group already uses (or that sits inside or around one)."""
+    path = Path(path).resolve()
+    for other in taken:
+        other = Path(other).resolve()
+        if path == other or other in path.parents or path in other.parents:
+            raise ValueError(f"{other} already belongs to another of your groups. Each group needs its own server folder.")
+
+
 def replace_synced_files(src: Path, dest: Path, move: bool) -> None:
     """Make dest's synced files exactly src's. Per-PC files in dest (see SKIP) are left alone."""
     src, dest = Path(src), Path(dest)
@@ -395,7 +404,8 @@ class Group:
 
     # setup
     @classmethod
-    def create(cls, st, app_dir, group_name, world_path, player):
+    def create(cls, st, app_dir, group_name, world_path, player, taken=()):
+        check_not_taken(world_path, taken)
         info = {"name": group_name, "world_id": "wb-world-" + secrets.token_hex(6),
                 "baton_id": "wb-baton-" + secrets.token_hex(6), "world_path": str(world_path), "owner": st.my_id}
         g = cls(st, info, app_dir)
@@ -408,7 +418,9 @@ class Group:
         return g
 
     @classmethod
-    def join(cls, st, app_dir, invite: dict, servers_dir: Path):
+    def join(cls, st, app_dir, invite: dict, servers_dir: Path, joined=()):
+        if invite["w"] in joined:
+            raise ValueError(f"You're already in {invite['g']}.")
         world_path = Path(servers_dir) / safe_folder_name(invite["g"])
         if world_path.exists() and any(world_path.iterdir()):
             raise ValueError(f"{world_path} already exists and isn't empty. Move or rename it first.")
@@ -614,12 +626,13 @@ class Group:
         self.write_baton({**baton, "server_up": up})
         return "up" if up else "down"
 
-    def move_world(self, new_path) -> None:
+    def move_world(self, new_path, taken=()) -> None:
         """Use another server folder (e.g. one the player made in SquidServers) for this group.
         The group's files are copied in; that folder's own per-PC files (start scripts, RAM, logs) stay."""
         new, old = Path(new_path), self.world_path
         if new.resolve() == old.resolve():
             return
+        check_not_taken(new, taken)
         if server_running(old) or server_running(new):
             raise ValueError("Stop the server in SquidServers first.")
         baton = self.read_baton()
@@ -682,9 +695,13 @@ class Group:
         need = fs.get("needFiles", 0)
         can, reason = host_check(baton, self.st.my_id, self.local_version(), need, now, self._backup_version(baton, need))
         names, online = self.st.devices(), self.st.connected()
+        try:  # only this group's friends (other groups' friends are devices too)
+            shared = {d["deviceID"] for d in self.st.folder(self.world_id).get("devices", [])}
+        except Exception:
+            shared = set(names)
         members = []
         for dev_id, name in names.items():
-            if dev_id == self.st.my_id:
+            if dev_id == self.st.my_id or dev_id not in shared:
                 continue
             try:
                 done = self.st.completion(self.world_id, dev_id)
@@ -930,6 +947,21 @@ class Group:
         self.st.set_folder(self.world_id, type="sendreceive", paused=False)
         self.st.scan(self.world_id)
         return warning
+
+    def leave(self) -> None:
+        """Stop being part of this group on this PC. The server folder and its world stay on disk."""
+        baton = self.read_baton()
+        if baton and baton.get("holder") == self.st.my_id:
+            raise ValueError("You're hosting this group. Press Stop hosting first.")
+        self.cancel_request()
+        for folder_id in (self.world_id, self.baton_id):
+            try:
+                self.st.remove_folder(folder_id)
+            except Exception:
+                pass  # already gone
+        shutil.rmtree(self.baton_file.parent, ignore_errors=True)  # this PC's copy of the shared baton files
+        for p in (self._marks_file, self._seen_file):
+            p.unlink(missing_ok=True)
 
     def discard_session(self) -> None:
         if server_running(self.world_path):

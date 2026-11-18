@@ -137,6 +137,18 @@ class FindingSquidServers(unittest.TestCase):
             self.assertTrue(tools.squid_installed())
 
 
+class ConfigUpgrade(unittest.TestCase):
+    def test_one_group_becomes_a_list(self):
+        from worldbaton.app import upgrade_config
+        old = {"player": "Sam", "address": "sam.gg", "group": {"world_id": "wb-world-1", "name": "Big P"}}
+        cfg = upgrade_config(old)
+        self.assertEqual(cfg["groups"], [{"world_id": "wb-world-1", "name": "Big P", "address": "sam.gg"}])
+        self.assertEqual(cfg["active"], "wb-world-1")
+        self.assertNotIn("group", cfg)
+        self.assertEqual(upgrade_config({"player": "New"})["groups"], [])
+        self.assertEqual(upgrade_config(dict(cfg)), cfg, "upgrading twice changes nothing")
+
+
 class Discord(unittest.TestCase):
     def test_only_webhook_links(self):
         self.assertTrue(tools.valid_webhook("https://discord.com/api/webhooks/123456/abc-DEF_9"))

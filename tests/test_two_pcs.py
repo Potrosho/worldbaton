@@ -205,6 +205,40 @@ class TwoFriends(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in backup.glob("*.zip")),
                          [f"{ga.world_id}-v{v}.zip" for v in (4, 5, 6)])
 
+    def test_two_groups_on_one_pc(self):
+        """Alex has two groups; Sam is only in one. Friends, folders and leaving stay per group."""
+        a, b = self.a, self.b
+        addr_a, addr_b = local_only(a), local_only(b)
+        servers = [self.tmp / "alex-modded", self.tmp / "alex-vanilla"]
+        for s in servers:
+            (s / "world").mkdir(parents=True)
+            (s / "world" / "level.dat").write_text(s.name)
+        modded = core.Group.create(a, self.tmp / "a-app", "Modded", servers[0], "Alex")
+        vanilla = core.Group.create(a, self.tmp / "a-app", "Vanilla", servers[1], "Alex", taken=[servers[0]])
+        for clash in (servers[0], servers[0] / "world"):  # the same folder, or one inside it, can't be shared
+            with self.assertRaises(ValueError):
+                core.Group.create(a, self.tmp / "a-app", "Again", clash, "Alex", taken=[servers[0], servers[1]])
+
+        invite = core.decode_invite(modded.invite_code("Alex"))
+        sam = core.Group.join(b, self.tmp / "b-app", invite, self.tmp / "sam-servers")
+        with self.assertRaises(ValueError):  # joining the same group twice
+            core.Group.join(b, self.tmp / "b-app", invite, self.tmp / "sam-servers2", joined=[sam.world_id])
+        b.add_device(a.my_id, "Alex", introducer=True, addresses=[addr_a])
+        modded.add_member(core.decode_join(core.encode_join(b.my_id, "Sam")))
+        a.add_device(b.my_id, "Sam", addresses=[addr_b])
+        wait_for(lambda: sam.local_version() == 1 and (sam.world_path / "world" / "level.dat").exists(),
+                 "Sam gets the modded world")
+
+        self.assertEqual([m["name"] for m in modded.status()["members"]], ["Sam"])
+        self.assertEqual(vanilla.status()["members"], [], "Sam isn't in the vanilla group")
+        self.assertFalse((self.tmp / "sam-servers" / "Vanilla").exists())
+
+        vanilla.leave()
+        self.assertFalse(a.has_folder(vanilla.world_id))
+        self.assertFalse(a.has_folder(vanilla.baton_id))
+        self.assertEqual((servers[1] / "world" / "level.dat").read_text(), "alex-vanilla", "leaving keeps the files")
+        self.assertTrue(a.has_folder(modded.world_id))
+
     def test_restore_an_earlier_world(self):
         """Alex hosts twice, then brings back the first session's world; it's shared as a new version."""
         a = self.a

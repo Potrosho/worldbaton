@@ -79,6 +79,9 @@ class Syncthing:
     def patch(self, path, body):
         return self._req("PATCH", path, body)
 
+    def delete(self, path):
+        return self._req("DELETE", path)
+
     def put(self, path, body):
         return self._req("PUT", path, body)
 
@@ -111,6 +114,10 @@ class Syncthing:
 
     def folder(self, folder_id: str) -> dict:
         return self.get(f"/rest/config/folders/{folder_id}")
+
+    def remove_folder(self, folder_id: str) -> None:
+        """Stop syncing a folder on this PC. Its files stay where they are."""
+        self.delete(f"/rest/config/folders/{folder_id}")
 
     def set_folder(self, folder_id: str, **fields) -> None:
         self.patch(f"/rest/config/folders/{folder_id}", fields)

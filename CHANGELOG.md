@@ -4,6 +4,9 @@ What changed in each version, in plain words. WorldBaton shows this in its *What
 update, and as the notes of each GitHub release. Every release needs a section here (the release build checks).
 
 ## 0.4.0
+- Multiple groups: be in several groups at once and switch between them at the top of My group. Every group
+  keeps syncing in the background, each has its own tunnel address, and you can leave a group (its
+  files stay on your PC).
 - Notifications: get told when someone starts hosting, when their server is up (with the address), when it's
   your turn, and when the server changes. Turn them off in the new Settings tab.
 - WorldBaton can keep running in the tray when you close the window, and start with Windows, so friends can get

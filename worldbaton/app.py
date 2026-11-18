@@ -49,12 +49,25 @@ def dark_title_bar(win) -> None:
 DEFAULT_SETTINGS = {"notify": True, "tray": True}
 
 
+def upgrade_config(cfg: dict) -> dict:
+    """Versions before 0.4.0 had one group per PC and one tunnel address; now each group has its own."""
+    if "group" in cfg:
+        old = cfg.pop("group")
+        old.setdefault("address", cfg.get("address", ""))
+        cfg["groups"], cfg["active"] = [old], old["world_id"]
+    cfg.setdefault("groups", [])
+    return cfg
+
+
 class App:
     def __init__(self, root: tk.Tk, hidden=False):
         self.root, self.cfg, self.group, self.st = root, load_config(), None, None
         self.cfg["settings"] = {**DEFAULT_SETTINGS, **self.cfg.get("settings", {})}
+        upgrade_config(self.cfg)
+        self.groups: list[core.Group] = []
+        self.statuses = {}  # world_id -> that group's latest status()
         self.busy = False
-        self.prev_status = self.notified_changes = self.activity_shown = None
+        self.notified_changes = self.activity_shown = None
         root.title(f"WorldBaton {__version__}")
         root.minsize(520, 460)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -107,11 +120,52 @@ class App:
             self.cfg["player"] = (name or os.environ.get("USERNAME") or "Player").strip()[:32]
             save_config(self.cfg)
         self.st.set_name(self.cfg["player"])
-        if self.cfg.get("group"):
-            self.group = core.Group(self.st, self.cfg["group"], APP_DIR)
-            self.st.set_ignores(self.group.world_id, core.IGNORES)  # groups made by older versions get new rules
+        for info in self.cfg["groups"]:
+            g = core.Group(self.st, info, APP_DIR)
+            self.groups.append(g)
+            try:
+                self.st.set_ignores(g.world_id, core.IGNORES)  # groups made by older versions get new rules
+            except Exception:
+                pass
+        self.group = next((g for g in self.groups if g.world_id == self.cfg.get("active")),
+                          self.groups[0] if self.groups else None)
         self.show()
+        self.tick()  # these two run for as long as WorldBaton does, for every group
+        self.beat()
         self.check_updates()
+
+    def switch_to(self, g):
+        self.group = g
+        self.cfg["active"] = g.world_id if g else None
+        save_config(self.cfg)
+        self.notified_changes = self.activity_shown = None
+        self.history_built = False
+        self.show()
+
+    def add_group(self, g):
+        self.groups.append(g)
+        self.cfg["groups"].append(g.info)
+        self.switch_to(g)
+
+    def address_for(self, g) -> str:
+        """This PC's tunnel address for that group's server (each SquidServers server has its own tunnel)."""
+        return g.info.get("address", "")
+
+    def leave_group(self):
+        g = self.group
+        if not messagebox.askyesno("Leave group", f"Leave {g.info['name']} on this PC?\n\nWorldBaton stops syncing "
+                                   f"it here. The server folder stays where it is:\n{g.world_path}\n\nTo come back "
+                                   "later, ask for a new invite.", icon="warning"):
+            return
+        try:
+            g.leave()
+        except Exception as e:
+            messagebox.showerror("WorldBaton", str(e))
+            return
+        self.groups.remove(g)
+        self.cfg["groups"].remove(g.info)
+        self.statuses.pop(g.world_id, None)
+        self.switch_to(self.groups[0] if self.groups else None)
 
     # --- screens -----------------------------------------------------------------
     GUIDE = [
@@ -151,6 +205,8 @@ class App:
         ("p", "• Turn on Start WorldBaton when I sign in to Windows (Settings), so friends can get the world from you "
               "even when you didn't open it. It waits in the tray."),
         ("p", "• Made a mistake? The History tab can bring back an earlier world for everyone."),
+        ("p", "• In more than one group? Press Add a group… at the top of My group, then switch between them there. "
+              "Each group needs its own server folder (in SquidServers: its own server)."),
         ("h", "Mods and fair play"),
         ("p", "• When the host adds or removes a mod, everyone sees it under My group. Press Update my game's mods "
               "to copy them into your own Minecraft, or you can't join."),
@@ -231,13 +287,15 @@ class App:
         for w in self.body.winfo_children():
             w.destroy()
 
-    def show(self):
+    def show(self, adding=False):
         self.clear()
         self.build_settings()
         self.refresh_history()
-        if self.group:
+        if self.group and not adding:
             self.show_group()
         else:
+            if self.groups:
+                ttk.Button(self.body, text="← Back to my groups", command=self.show).pack(anchor="w", pady=(0, 8))
             ttk.Label(self.body, text=f"Hi {self.cfg['player']}!", font=("Segoe UI", 14, "bold")).pack(pady=(0, 8))
             ttk.Label(self.body, text="Share one Minecraft server with friends.\nWhoever is online can host it.",
                       justify="center").pack(pady=(0, 6))
@@ -265,7 +323,17 @@ class App:
 
     def show_group(self):
         b = self.body
-        ttk.Label(b, text=self.group.info["name"], font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        top = ttk.Frame(b)
+        top.pack(fill="x")
+        if len(self.groups) > 1:
+            names = [g.info["name"] for g in self.groups]
+            pick = ttk.Combobox(top, values=names, state="readonly", width=28, font=("Segoe UI", 12, "bold"))
+            pick.current(self.groups.index(self.group))
+            pick.bind("<<ComboboxSelected>>", lambda _: self.switch_to(self.groups[pick.current()]))
+            pick.pack(side="left")
+        else:
+            ttk.Label(top, text=self.group.info["name"], font=("Segoe UI", 14, "bold")).pack(side="left")
+        ttk.Button(top, text="Add a group…", command=lambda: self.show(adding=True)).pack(side="right")
         self.headline = ttk.Label(b, font=("Segoe UI", 11, "bold"), wraplength=440)
         self.headline.pack(anchor="w", pady=(8, 0))
         addr_row = ttk.Frame(b)
@@ -313,37 +381,46 @@ class App:
         ttk.Button(row2, text="My address…", command=self.ask_address).pack(side="left")
         self.backup_label = ttk.Label(b, wraplength=440, foreground="#a0a0a0")
         self.backup_label.pack(anchor="w", pady=(8, 0))
+        ttk.Button(b, text="Leave this group…", command=self.leave_group).pack(anchor="w", pady=(6, 0))
         self.show_backup()
-        self.tick()
-        self.beat()
+        if self.group.world_id in self.statuses:
+            self.render(self.statuses[self.group.world_id])  # don't wait for the next refresh after switching
 
     # --- refresh -----------------------------------------------------------------
     def tick(self):
-        if not self.group or not self.headline.winfo_exists():
-            return
-        if self.busy:  # never reconcile while a restore/backup is touching the server folder
-            self.root.after(REFRESH_MS, self.tick)
-            return
+        """Every few seconds: keep every group synced and watched, then refresh the group on screen."""
+        if not self.busy:  # never reconcile while a restore/backup is touching a server folder
+            for g in list(self.groups):
+                self.watch_group(g)
+            s = self.statuses.get(self.group.world_id) if self.group else None
+            if s and getattr(self, "headline", None) and self.headline.winfo_exists():
+                self.render(s)
+        self.root.after(REFRESH_MS, self.tick)
+
+    def watch_group(self, g):
         try:
-            self.group.reconcile()
-            s = self.group.status()
+            g.reconcile()
+            s = g.status()
         except Exception as e:
-            self.reason.config(text=f"Sync engine busy ({e}). Retrying…")
-            self.root.after(REFRESH_MS, self.tick)
+            if g is self.group and getattr(self, "headline", None) and self.headline.winfo_exists():
+                self.reason.config(text=f"Sync engine busy ({e}). Retrying…")
             return
-        self.last_status = s
+        player, name = self.cfg["player"], g.info["name"]
         if s["me_hosting"]:
             try:  # every refresh, so there's little time to edit the log before it's read
-                self.group.record_activity(self.cfg["player"])
-                self.group.watch_offline_edits(self.cfg["player"])
-                if self.group.update_server_up() == "up":
-                    self.post_discord(f"🟢 **{self.cfg['player']}** is hosting **{self.group.info['name']}**. "
-                                      f"Join at `{self.cfg.get('address') or 'ask them for the address'}`")
+                g.record_activity(player)
+                g.watch_offline_edits(player)
+                if g.update_server_up() == "up":
+                    self.post_discord(g, f"🟢 **{player}** is hosting **{name}**. "
+                                         f"Join at `{self.address_for(g) or 'ask them for the address'}`")
             except Exception:
                 pass
-        for title, message in core.events(self.prev_status, s, self.st.my_id):
-            self.notify(title, message)
-        self.prev_status = s
+        for title, message in core.events(self.statuses.get(g.world_id), s, self.st.my_id):
+            self.notify(f"{name}: {title}" if len(self.groups) > 1 else title, message)
+        self.statuses[g.world_id] = s
+
+    def render(self, s):
+        """Show one group's status on the My group tab."""
         baton = s["baton"] or {}
         self.address.pack_forget()
         self.copy_btn.pack_forget()
@@ -398,7 +475,6 @@ class App:
         someone_else = s["holder_alive"] and not s["me_hosting"]
         self.ask_btn.config(text="Cancel my request" if s["my_request"] else "Ask to host next",
                             state="normal" if someone_else or s["my_request"] else "disabled")
-        self.root.after(REFRESH_MS, self.tick)
 
     def show_changes(self, s):
         """Mods/operators that changed since this player last pressed Got it."""
@@ -457,13 +533,13 @@ class App:
         self.activity.config(state="disabled")
 
     def beat(self):
-        if self.group and not self.busy:
-            try:
-                self.group.heartbeat()
-            except Exception:
-                pass
-        if self.group:
-            self.root.after(core.HEARTBEAT_EVERY * 1000, self.beat)
+        if not self.busy:
+            for g in list(self.groups):
+                try:
+                    g.heartbeat()
+                except Exception:
+                    pass
+        self.root.after(core.HEARTBEAT_EVERY * 1000, self.beat)
 
     # --- actions -----------------------------------------------------------------
     def create_group(self):
@@ -475,13 +551,12 @@ class App:
         if not name:
             return
         try:
-            self.group = core.Group.create(self.st, APP_DIR, name.strip(), Path(path), self.cfg["player"])
+            g = core.Group.create(self.st, APP_DIR, name.strip(), Path(path), self.cfg["player"],
+                                  taken=[x.world_path for x in self.groups])
         except Exception as e:
             messagebox.showerror("WorldBaton", str(e))
             return
-        self.cfg["group"] = self.group.info
-        save_config(self.cfg)
-        self.show()
+        self.add_group(g)
         self.invite()
 
     def join_group(self):
@@ -492,13 +567,11 @@ class App:
             invite = core.decode_invite(code)
             squid = tools.squid_servers_dir()
             parent = squid if squid.is_dir() else Path.home() / "WorldBaton servers"
-            self.group = core.Group.join(self.st, APP_DIR, invite, parent)
+            g = core.Group.join(self.st, APP_DIR, invite, parent, joined=[x.world_id for x in self.groups])
         except Exception as e:
             messagebox.showerror("WorldBaton", str(e))
             return
-        self.cfg["group"] = self.group.info
-        save_config(self.cfg)
-        self.show()
+        self.add_group(g)
         self.code_dialog(f"Send this code back to {invite['on']} so they can let you in:",
                          core.encode_join(self.st.my_id, self.cfg["player"]))
 
@@ -524,14 +597,15 @@ class App:
         """Ask for this PC's tunnel address and remember it. False if cancelled."""
         msg = ("Paste your server address from SquidServers (the tunnel address friends join with).\n"
                "WorldBaton remembers it. You can leave it empty and tell friends yourself.")
-        addr = simpledialog.askstring("My address", msg, initialvalue=self.cfg.get("address", ""), parent=self.root)
+        addr = simpledialog.askstring(f"My address for {self.group.info['name']}", msg,
+                                      initialvalue=self.address_for(self.group), parent=self.root)
         if addr is None:
             return False
-        self.cfg["address"] = addr.strip()
+        self.group.info["address"] = addr.strip()
         save_config(self.cfg)
-        baton = self.group.read_baton() if self.group else None
+        baton = self.group.read_baton()
         if baton and baton.get("holder") == self.st.my_id:  # hosting now: show friends the new address
-            self.group.write_baton({**baton, "address": self.cfg["address"]})
+            self.group.write_baton({**baton, "address": self.group.info["address"]})
         return True
 
     def host(self):
@@ -539,9 +613,9 @@ class App:
         if problems and not messagebox.askyesno("Before you host", "\n\n".join(problems) + "\n\nHost anyway?",
                                                 icon="warning"):
             return
-        if "address" not in self.cfg and not self.ask_address():
+        if "address" not in self.group.info and not self.ask_address():
             return
-        addr = self.cfg["address"]
+        addr = self.address_for(self.group)
         self.run_busy("Getting the world ready…", lambda: self.group.start_hosting(self.cfg["player"], addr),
                       lambda _: messagebox.showinfo("WorldBaton", "You're the host. Start the server in SquidServers now.\n"
                                                     "When you're done: stop the server there, then press 'Stop hosting' here."))
@@ -553,7 +627,7 @@ class App:
             tip = ("If you use a cloud drive as the backup folder, wait until it says it's up to date before turning off your PC."
                    if self.group.backup_dir else "")
             messagebox.showinfo("WorldBaton", "Done! Keep WorldBaton open until your friends show 100% synced.\n" + tip)
-            self.post_discord(f"⚪ **{self.cfg['player']}** stopped hosting **{self.group.info['name']}**. "
+            self.post_discord(self.group, f"⚪ **{self.cfg['player']}** stopped hosting **{self.group.info['name']}**. "
                               "Their session is being shared with the group.")
             self.refresh_history()
         self.run_busy("Sharing your session…", lambda: self.group.stop_hosting(self.cfg["player"]), done)
@@ -569,7 +643,6 @@ class App:
             if not path:
                 return
             self.group.set_backup_dir(Path(path))
-        self.cfg["group"] = self.group.info
         save_config(self.cfg)
         self.show_backup()
 
@@ -588,11 +661,11 @@ class App:
             return
 
         def done(_):
-            self.cfg["group"] = self.group.info
             save_config(self.cfg)
             messagebox.showinfo("WorldBaton", f"Done! The group's world now lives in:\n{path}\n\n"
                                 "You can start it from SquidServers when it's your turn to host.")
-        self.run_busy("Copying the group's files…", lambda: self.group.move_world(Path(path)), done)
+        others = [x.world_path for x in self.groups if x is not self.group]
+        self.run_busy("Copying the group's files…", lambda: self.group.move_world(Path(path), taken=others), done)
 
     def show_backup(self):
         d = self.group.backup_dir
@@ -649,8 +722,8 @@ class App:
                 return
         self.root.after(300, self.poll_tray)
 
-    def post_discord(self, text):
-        url = self.group.group_settings().get("discord_webhook") if self.group else None
+    def post_discord(self, group, text):
+        url = group.group_settings().get("discord_webhook")
         if url:  # in the background: a slow or broken webhook must never freeze the window
             threading.Thread(target=lambda: self._try_post(url, text), daemon=True).start()
 
@@ -746,6 +819,8 @@ class App:
         if not self.group:
             return
 
+        ttk.Separator(f).pack(fill="x", pady=(12, 0))
+        ttk.Label(f, text=f"For {self.group.info['name']}", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(6, 0))
         heading("World backups")
         keep = tk.BooleanVar(value=self.group.keep_local > 0)
 
@@ -885,24 +960,31 @@ class App:
             return
         self.quit()
 
+    def hosting(self) -> list[str]:
+        """Names of the groups this PC is hosting right now."""
+        return [g.info["name"] for g in self.groups if self.statuses.get(g.world_id, {}).get("me_hosting")]
+
     def quit(self):
-        s = getattr(self, "last_status", None)
-        if s and s["me_hosting"]:
-            if not messagebox.askyesno("WorldBaton", "You're hosting. If you close WorldBaton, friends can take over "
-                                       "after 5 minutes and your session won't be shared. Close anyway?"):
+        unsynced = [g.info["name"] for g in self.groups
+                    if (s := self.statuses.get(g.world_id)) and s["baton"] and s["baton"].get("last_host") == self.st.my_id
+                    and any(m["online"] and (m["synced"] or 0) < 100 for m in s["members"])]
+        if self.hosting():
+            if not messagebox.askyesno("WorldBaton", f"You're hosting {', '.join(self.hosting())}. If you close "
+                                       "WorldBaton, friends can take over after 5 minutes and your session won't be "
+                                       "shared. Close anyway?"):
                 return
-        elif s and s["baton"] and s["baton"].get("last_host") == self.st.my_id and any(
-                m["online"] and (m["synced"] or 0) < 100 for m in s["members"]):
-            if not messagebox.askyesno("WorldBaton", "Your friends don't have your latest world yet. Close anyway?"):
+        elif unsynced:
+            if not messagebox.askyesno("WorldBaton", f"Your friends in {', '.join(unsynced)} don't have your latest "
+                                       "world yet. Close anyway?"):
                 return
         self.shutdown()
 
     def shutdown(self):
         self.tray.stop()
         if self.st:
-            if self.group:
+            for g in self.groups:
                 try:
-                    self.group.park()
+                    g.park()
                 except Exception:
                     pass  # engine already gone; nothing can be sent anyway
             self.st.stop()
@@ -938,8 +1020,7 @@ class App:
         poll()
 
     def offer_update(self, tag, url, notes=""):
-        s = getattr(self, "last_status", None)
-        if s and s["me_hosting"]:
+        if self.hosting():
             messagebox.showinfo("WorldBaton", f"WorldBaton {tag} is out. It'll offer to update next time you open it "
                                 "when you're not hosting.")
             return

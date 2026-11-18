@@ -1,7 +1,6 @@
 """The abuse catcher: admin commands, mod/setting changes, and the ways a host might try to hide them."""
 import gzip
 import json
-import os
 import tempfile
 import time
 import unittest
