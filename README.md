@@ -1,3 +1,5 @@
+<img src="assets/worldbaton.png" width="96" alt="WorldBaton logo">
+
 # WorldBaton
 
 Share one Minecraft server with your friends. Whoever is online can host it.
@@ -106,6 +108,8 @@ python -m worldbaton
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+The logo in `assets/` is drawn by `scripts/make_icon.py` (needs `pip install pillow`); rerun it after changing the design.
 
 Build `dist\WorldBaton.exe` (needs `pip install pyinstaller`):
 

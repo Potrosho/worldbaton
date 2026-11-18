@@ -2,6 +2,7 @@
 import ctypes
 import json
 import os
+import sys
 import threading
 import time
 import tkinter as tk
@@ -15,6 +16,8 @@ from .syncthing import Syncthing
 
 APP_DIR = Path(os.environ.get("WORLDBATON_HOME") or Path(os.environ.get("APPDATA", Path.home())) / "WorldBaton")
 CONFIG = APP_DIR / "config.json"
+# PyInstaller unpacks bundled files under sys._MEIPASS; in a source checkout they live in assets/.
+ICON = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)) / "assets" / "worldbaton.png"
 SQUID_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "SquidServers"
 REFRESH_MS = 3000
 
@@ -646,6 +649,10 @@ def main():
     sv_ttk.set_theme("dark", root)
     root.tk.call("configure_colors")  # Tk 9 doesn't fire the theme's <<ThemeChanged>> hook, leaving pages light
     dark_title_bar(root)
+    try:
+        root.iconphoto(True, tk.PhotoImage(file=ICON))  # True: every window and dialog uses it
+    except tk.TclError:
+        pass  # missing icon file: keep the default rather than fail to start
     if accept_risk(root):
         App(root)
         root.mainloop()
