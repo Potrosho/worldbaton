@@ -24,8 +24,8 @@ jobs:
       - name: Take the release notes from CHANGELOG.md
         run: python -m worldbaton.changelog "${{ github.ref_name }}" notes.md
 
-      - name: Install sv-ttk (window theme)
-        run: pip install sv-ttk
+      - name: Install the window theme and tray libraries
+        run: pip install sv-ttk pystray pillow
 
       - name: Get Syncthing
         run: python scripts/get_syncthing.py
@@ -35,7 +35,7 @@ jobs:
 
       - name: Build
         run: |
-          pip install pyinstaller sv-ttk
+          pip install pyinstaller
           ./build.ps1
 
       - name: Publish release

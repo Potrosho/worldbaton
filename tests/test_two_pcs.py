@@ -205,6 +205,28 @@ class TwoFriends(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in backup.glob("*.zip")),
                          [f"{ga.world_id}-v{v}.zip" for v in (4, 5, 6)])
 
+    def test_restore_an_earlier_world(self):
+        """Alex hosts twice, then brings back the first session's world; it's shared as a new version."""
+        a = self.a
+        server = self.tmp / "alex-server"
+        (server / "world").mkdir(parents=True)
+        (server / "world" / "level.dat").write_text("day 1")
+        g = core.Group.create(a, self.tmp / "a-app", "Big P", server, "Alex")
+        for day in (2, 3):
+            g.start_hosting("Alex", "alex.example")
+            (server / "world" / "level.dat").write_text(f"day {day}")
+            self.assertEqual(g.stop_hosting("Alex"), "")
+        self.assertEqual([b["version"] for b in g.backups()], [3, 2])  # this PC keeps the last 2
+
+        warning = g.restore_version("Alex", next(b for b in g.backups() if b["version"] == 2))
+        self.assertEqual(warning, "")
+        self.assertEqual((server / "world" / "level.dat").read_text(), "day 2")
+        self.assertEqual(g.local_version(), 4)
+        self.assertIsNone(g.read_baton()["holder"])
+        newest = g.history()[0]
+        self.assertEqual((newest["version"], newest["restored_from"]), (4, 2))
+        self.assertEqual([b["version"] for b in g.backups()], [4, 3])
+
 
 if __name__ == "__main__":
     unittest.main()

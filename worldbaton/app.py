@@ -11,13 +11,12 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import sv_ttk
 
-from . import __version__, changelog, core, updater
+from . import __version__, changelog, core, tools, updater
+from .app_paths import APP_DIR, ICON
+from .tray import Tray
 from .syncthing import Syncthing
 
-APP_DIR = Path(os.environ.get("WORLDBATON_HOME") or Path(os.environ.get("APPDATA", Path.home())) / "WorldBaton")
 CONFIG = APP_DIR / "config.json"
-# PyInstaller unpacks bundled files under sys._MEIPASS; in a source checkout they live in assets/.
-ICON = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)) / "assets" / "worldbaton.png"
 SQUID_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "SquidServers"
 REFRESH_MS = 3000
 
@@ -47,23 +46,39 @@ def dark_title_bar(win) -> None:
         pass
 
 
+DEFAULT_SETTINGS = {"notify": True, "tray": True}
+
+
 class App:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, hidden=False):
         self.root, self.cfg, self.group, self.st = root, load_config(), None, None
+        self.cfg["settings"] = {**DEFAULT_SETTINGS, **self.cfg.get("settings", {})}
         self.busy = False
+        self.prev_status = self.notified_changes = self.activity_shown = None
         root.title(f"WorldBaton {__version__}")
         root.minsize(520, 460)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.tabs = ttk.Notebook(root)
         self.tabs.pack(fill="both", expand=True)
         self.body = ttk.Frame(self.tabs, padding=16)
+        self.history_tab = ttk.Frame(self.tabs, padding=16)
+        self.settings_tab = ttk.Frame(self.tabs, padding=16)
         self.guide = ttk.Frame(self.tabs, padding=16)
         self.news = ttk.Frame(self.tabs, padding=16)
         self.tabs.add(self.body, text="My group")
+        self.tabs.add(self.history_tab, text="History")
+        self.tabs.add(self.settings_tab, text="Settings")
         self.tabs.add(self.guide, text="Setup guide")
         self.tabs.add(self.news, text="What's new")
+        self.tabs.bind("<<NotebookTabChanged>>", lambda _: self.refresh_history())
         self.build_guide()
-        self.root.after(300, self.show_whats_new)
+        self.tray = Tray()
+        self.tray.start()  # the icon also carries notifications; without pystray, closing just quits
+        self.poll_tray()
+        if hidden and self.tray.icon:
+            root.withdraw()  # started with Windows: stay in the tray
+        else:
+            self.root.after(300, self.show_whats_new)
         ttk.Label(self.body, text="Starting sync engine…").pack()
         self.error = None
         threading.Thread(target=self._start_engine, daemon=True).start()
@@ -81,7 +96,7 @@ class App:
     def _wait_engine(self):
         if self.error:
             messagebox.showerror("WorldBaton", f"Couldn't start the sync engine:\n{self.error}")
-            self.root.destroy()
+            self.shutdown()
             return
         if not self.st:
             self.root.after(200, self._wait_engine)
@@ -127,9 +142,15 @@ class App:
         ("p", "3. When you're done, stop the server in SquidServers FIRST, then press Stop hosting."),
         ("p", "4. Keep WorldBaton open until your friends show 100% synced."),
         ("p", "• Only start the server when WorldBaton says you're the host. Anything played otherwise is undone."),
+        ("h", "Taking turns"),
+        ("p", "• Someone else hosting and you want to go next? Press Ask to host next. They're told, and so are you "
+              "when it's your turn."),
+        ("p", "• Turn on Start WorldBaton when I sign in to Windows (Settings), so friends can get the world from you "
+              "even when you didn't open it. It waits in the tray."),
+        ("p", "• Made a mistake? The History tab can bring back an earlier world for everyone."),
         ("h", "Mods and fair play"),
-        ("p", "• When the host adds or removes a mod, everyone sees it under My group. Put the same mod in your own "
-              "Minecraft's mods folder too, or you can't join."),
+        ("p", "• When the host adds or removes a mod, everyone sees it under My group. Press Update my game's mods "
+              "to copy them into your own Minecraft, or you can't join."),
         ("p", "• Admin commands (op, gamemode, give, tp…) used on the server are listed under Host activity for the whole "
               "group. So are signs someone tried to hide them: an edited server log, files changed while the server "
               "was off, or mods loaded from somewhere else. Those show in red."),
@@ -209,6 +230,8 @@ class App:
 
     def show(self):
         self.clear()
+        self.build_settings()
+        self.refresh_history()
         if self.group:
             self.show_group()
         else:
@@ -236,6 +259,8 @@ class App:
         self.changes = ttk.Label(self.changes_box, wraplength=440, foreground="#ffd479")
         self.changes_row = ttk.Frame(self.changes_box)
         ttk.Button(self.changes_row, text="Got it", command=self.ack_changes).pack(side="left", padx=(0, 6))
+        ttk.Button(self.changes_row, text="Update my game's mods", command=self.update_game_mods).pack(side="left",
+                                                                                                   padx=(0, 6))
         ttk.Button(self.changes_row, text="Open server mods folder",
                    command=lambda: os.startfile(self.group.world_path / "mods")).pack(side="left")
 
@@ -254,7 +279,8 @@ class App:
         self.host_btn = ttk.Button(row, text="Host now", command=self.host)
         self.stop_btn = ttk.Button(row, text="Stop hosting", command=self.stop)
         self.discard_btn = ttk.Button(row, text="Discard my session", command=self.discard)
-        for w in (self.host_btn, self.stop_btn, self.discard_btn):
+        self.ask_btn = ttk.Button(row, text="Ask to host next", command=self.toggle_request)
+        for w in (self.host_btn, self.stop_btn, self.discard_btn, self.ask_btn):
             w.pack(side="left", padx=(0, 6))
         row2 = ttk.Frame(b)
         row2.pack(fill="x", pady=(6, 0))
@@ -288,8 +314,14 @@ class App:
             try:  # every refresh, so there's little time to edit the log before it's read
                 self.group.record_activity(self.cfg["player"])
                 self.group.watch_offline_edits(self.cfg["player"])
+                if self.group.update_server_up() == "up":
+                    self.post_discord(f"🟢 **{self.cfg['player']}** is hosting **{self.group.info['name']}**. "
+                                      f"Join at `{self.cfg.get('address') or 'ask them for the address'}`")
             except Exception:
                 pass
+        for title, message in core.events(self.prev_status, s, self.st.my_id):
+            self.notify(title, message)
+        self.prev_status = s
         baton = s["baton"] or {}
         self.address.pack_forget()
         self.copy_btn.pack_forget()
@@ -306,8 +338,15 @@ class App:
             self.copy_btn.pack(side="left", padx=6)
         else:
             self.headline.config(text="Nobody is hosting.")
-        self.reason.config(text="" if s["me_hosting"] else s["reason"] +
-                           (f" ({s['need_bytes'] / 1e6:.0f} MB left)" if s["need_bytes"] else ""))
+        if s["me_hosting"]:
+            asking = s["requests"]
+            self.reason.config(text=f"{' and '.join(asking)} {'wants' if len(asking) == 1 else 'want'} to host next. "
+                                    "When you're done, stop the server in SquidServers, then press Stop hosting."
+                               if asking else "")
+        else:
+            self.reason.config(text=s["reason"] + (f" ({s['need_bytes'] / 1e6:.0f} MB left)" if s["need_bytes"] else "")
+                               + ("\nYou asked to host next. You'll be told when it's your turn."
+                                  if s["my_request"] else ""))
 
         warns = []
         if s["lost_baton"]:
@@ -334,6 +373,9 @@ class App:
         self.host_btn.config(state="normal" if s["can_host"] else "disabled")
         self.stop_btn.config(state="normal" if s["me_hosting"] else "disabled")
         self.discard_btn.config(state="normal" if s["lost_baton"] else "disabled")
+        someone_else = s["holder_alive"] and not s["me_hosting"]
+        self.ask_btn.config(text="Cancel my request" if s["my_request"] else "Ask to host next",
+                            state="normal" if someone_else or s["my_request"] else "disabled")
         self.root.after(REFRESH_MS, self.tick)
 
     def show_changes(self, s):
@@ -346,6 +388,9 @@ class App:
             if "seen" not in self.group.info:  # first look (or just joined and synced): nothing is "new"
                 self.ack_changes()
             changes = core.snapshot_changes(self.group.info["seen"], self.snapshot)
+        if self.notified_changes is not None and changes and set(changes) - set(self.notified_changes):
+            self.notify("The server changed", "\n".join(changes[:3]) + ("\n…" if len(changes) > 3 else ""))
+        self.notified_changes = changes
         if not changes:
             self.changes.pack_forget()
             self.changes_row.pack_forget()
@@ -368,6 +413,13 @@ class App:
         entries = self.group.activity()
         if entries == self.activity_shown:  # don't reset the scroll position every refresh
             return
+        if self.activity_shown is not None:
+            before = {(e.get("t"), e.get("text"), bool(e.get("removed"))) for e in self.activity_shown}
+            for e in entries:
+                flagged = e.get("removed") or e.get("text", "").startswith("⚠")
+                if flagged and (e.get("t"), e.get("text"), bool(e.get("removed"))) not in before:
+                    self.notify("Host activity", e.get("text", "").lstrip("⚠ ") +
+                                (" (deleted from the host's list)" if e.get("removed") else ""))
         self.activity_shown = entries
         self.activity.config(state="normal")
         self.activity.delete("1.0", "end")
@@ -460,6 +512,10 @@ class App:
         return True
 
     def host(self):
+        problems = tools.prehost_problems(self.group.world_path)
+        if problems and not messagebox.askyesno("Before you host", "\n\n".join(problems) + "\n\nHost anyway?",
+                                                icon="warning"):
+            return
         if "address" not in self.cfg and not self.ask_address():
             return
         addr = self.cfg["address"]
@@ -474,6 +530,9 @@ class App:
             tip = ("If you use a cloud drive as the backup folder, wait until it says it's up to date before turning off your PC."
                    if self.group.backup_dir else "")
             messagebox.showinfo("WorldBaton", "Done! Keep WorldBaton open until your friends show 100% synced.\n" + tip)
+            self.post_discord(f"⚪ **{self.cfg['player']}** stopped hosting **{self.group.info['name']}**. "
+                              "Their session is being shared with the group.")
+            self.refresh_history()
         self.run_busy("Sharing your session…", lambda: self.group.stop_hosting(self.cfg["player"]), done)
 
     def pick_backup(self):
@@ -550,6 +609,230 @@ class App:
         except Exception as e:
             messagebox.showerror("WorldBaton", str(e))
 
+    # --- tray, notifications, Discord ----------------------------------------------
+    def notify(self, title, message):
+        if self.cfg["settings"]["notify"]:
+            self.tray.notify(title, message)
+
+    def poll_tray(self):
+        """Handle tray menu clicks here, on tkinter's thread."""
+        while not self.tray.clicks.empty():
+            click = self.tray.clicks.get()
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+            if click == "quit":
+                self.quit()
+                return
+        self.root.after(300, self.poll_tray)
+
+    def post_discord(self, text):
+        url = self.group.group_settings().get("discord_webhook") if self.group else None
+        if url:  # in the background: a slow or broken webhook must never freeze the window
+            threading.Thread(target=lambda: self._try_post(url, text), daemon=True).start()
+
+    @staticmethod
+    def _try_post(url, text):
+        try:
+            tools.post_discord(url, text)
+        except Exception:
+            pass
+
+    # --- asking to host next, your game's mods -----------------------------------------
+    def toggle_request(self):
+        try:
+            if self.group.my_request():
+                self.group.cancel_request()
+            else:
+                self.group.request_host(self.cfg["player"])
+        except OSError as e:
+            messagebox.showerror("WorldBaton", str(e))
+
+    def pick_game_mods(self) -> bool:
+        start = tools.default_game_mods()
+        msg = ("Pick the mods folder of the Minecraft you play on.\n\n"
+               f"For the normal launcher it's {start}. For CurseForge, Prism or Modrinth, it's the mods folder "
+               "inside that profile's (instance's) folder.")
+        if not messagebox.askokcancel("My game's mods", msg):
+            return False
+        path = filedialog.askdirectory(title="Pick your game's mods folder",
+                                       initialdir=start if start.exists() else start.parent.parent)
+        if not path:
+            return False
+        self.group.info["game_mods"] = {"dir": path, "managed": []}
+        save_config(self.cfg)
+        self.build_settings()
+        return True
+
+    def update_game_mods(self):
+        mods = self.group.info.get("game_mods") or {}
+        if not mods.get("dir") and not self.pick_game_mods():
+            return
+        mods = self.group.info["game_mods"]
+        if not mods.get("managed") and not messagebox.askokcancel(
+                "My game's mods", "WorldBaton will copy the server's mods into:\n" + mods["dir"] + "\n\nMods you added "
+                "yourself stay. Mods the server drops later are removed again.\n\nA few mods only work on servers. If "
+                "your game won't start afterwards, remove that mod from the folder."):
+            return
+
+        def done(result):
+            added, removed, managed = result
+            mods["managed"] = managed
+            save_config(self.cfg)
+            messagebox.showinfo("WorldBaton", "Your game's mods match the server now."
+                                f"\nAdded or updated: {len(added)}\nRemoved: {len(removed)}")
+        self.run_busy("Copying mods…", lambda: tools.sync_game_mods(self.group.world_path / "mods", Path(mods["dir"]),
+                                                                    mods.get("managed", [])), done)
+
+    # --- Settings tab --------------------------------------------------------------
+    def build_settings(self):
+        f = self.settings_tab
+        for w in f.winfo_children():
+            w.destroy()
+        s = self.cfg["settings"]
+
+        def heading(text):
+            ttk.Label(f, text=text, font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(10, 2))
+
+        def note(text):
+            ttk.Label(f, text=text, wraplength=470, foreground="#a0a0a0").pack(anchor="w", padx=(28, 0))
+
+        def toggle(text, key):
+            var = tk.BooleanVar(value=s[key])
+
+            def changed():
+                s[key] = var.get()
+                save_config(self.cfg)
+            ttk.Checkbutton(f, text=text, variable=var, command=changed).pack(anchor="w")
+
+        heading("This PC")
+        toggle("Show notifications", "notify")
+        note("When someone starts hosting, their server is up, someone asks to host next, or the server changes.")
+        toggle("Keep running in the tray when I close the window", "tray")
+        auto = tk.BooleanVar(value=tools.autostart_enabled())
+
+        def set_auto():
+            try:
+                tools.set_autostart(auto.get())
+            except OSError as e:
+                auto.set(not auto.get())
+                messagebox.showerror("WorldBaton", str(e))
+        ttk.Checkbutton(f, text="Start WorldBaton when I sign in to Windows", variable=auto, command=set_auto,
+                        state="normal" if tools.can_autostart() else "disabled").pack(anchor="w")
+        note("It starts in the tray, so friends can get the world from you even when you didn't open it.")
+        if not self.group:
+            return
+
+        heading("World backups")
+        keep = tk.BooleanVar(value=self.group.keep_local > 0)
+
+        def set_keep():
+            self.group.info["local_backups"] = core.KEEP_LOCAL if keep.get() else 0
+            save_config(self.cfg)
+        ttk.Checkbutton(f, text=f"Keep the last {core.KEEP_LOCAL} worlds I host, so they can be restored", variable=keep,
+                        command=set_keep).pack(anchor="w")
+        note("Saved when you press Stop hosting. Each one is about the size of the server folder. Restore one from "
+             "the History tab.")
+
+        heading("My game's mods")
+        mods = (self.group.info.get("game_mods") or {}).get("dir")
+        ttk.Label(f, text=mods or "Not set yet.", wraplength=470).pack(anchor="w")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(4, 0))
+        ttk.Button(row, text="Choose folder…", command=self.pick_game_mods).pack(side="left", padx=(0, 6))
+        ttk.Button(row, text="Update my game's mods", command=self.update_game_mods).pack(side="left")
+
+        heading("Discord (whole group)")
+        hook = tk.StringVar(value=self.group.group_settings().get("discord_webhook", ""))
+        ttk.Entry(f, textvariable=hook, width=60, show="•").pack(anchor="w", fill="x")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(4, 0))
+
+        def save_hook():
+            url = hook.get().strip()
+            if url and not tools.valid_webhook(url):
+                messagebox.showerror("WorldBaton", "That isn't a Discord webhook link. In Discord: Server Settings → "
+                                     "Integrations → Webhooks → New Webhook → Copy Webhook URL.")
+                return
+            self.group.set_group_setting("discord_webhook", url)
+            messagebox.showinfo("WorldBaton", "Saved for the whole group." if url else "Discord posts are off.")
+
+        def test_hook():
+            try:
+                tools.post_discord(hook.get(), f"👋 WorldBaton test from {self.cfg['player']}.")
+                messagebox.showinfo("WorldBaton", "Sent! Check your Discord channel.")
+            except Exception as e:
+                messagebox.showerror("WorldBaton", f"Couldn't post: {e}")
+        ttk.Button(row, text="Save", command=save_hook).pack(side="left", padx=(0, 6))
+        ttk.Button(row, text="Send a test", command=test_hook).pack(side="left")
+        note("Posts in your channel when someone's server is up (with the address) and when they stop. Anyone in "
+             "the group can change it.")
+
+    # --- History tab -----------------------------------------------------------------
+    def refresh_history(self):
+        f = self.history_tab
+        if self.tabs.select() != str(f) and getattr(self, "history_built", False):
+            return  # only rebuilt while you look at it
+        self.history_built = True
+        for w in f.winfo_children():
+            w.destroy()
+        if not self.group:
+            ttk.Label(f, text="Join or create a group first.").pack(anchor="w")
+            return
+        backups = {b["version"]: b for b in self.group.backups()}
+        sessions = self.group.history()
+        seen = {e.get("version") for e in sessions}
+        rows = [(e.get("end", 0), e) for e in sessions] + [(b["path"].stat().st_mtime, {"version": v})
+                                                           for v, b in backups.items() if v not in seen]
+        ttk.Label(f, text="Every finished session, newest first. Versions with a backup can be brought back for "
+                          "everyone.", wraplength=470).pack(anchor="w", pady=(0, 8))
+        bottom = ttk.Frame(f)
+        bottom.pack(side="bottom", fill="x", pady=(8, 0))
+        tree = ttk.Treeview(f, columns=("when", "host", "length", "version", "backup"), show="headings", height=12)
+        for col, title, width in (("when", "Ended", 120), ("host", "Hosted by", 110), ("length", "Played", 70),
+                                  ("version", "Version", 60), ("backup", "Backup", 110)):
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor="w")
+        for end, e in sorted(rows, key=lambda r: r[0], reverse=True):
+            v = e.get("version")
+            length = ""
+            if e.get("start") and e.get("end"):
+                mins = int((e["end"] - e["start"]) // 60)
+                length = f"{mins // 60}h {mins % 60:02d}m" if mins >= 60 else f"{mins}m"
+            host = e.get("host", "?") + (f" (restored v{e['restored_from']})" if e.get("restored_from") else "")
+            b = backups.get(v)
+            tree.insert("", "end", iid=str(v), values=(
+                time.strftime("%d %b %H:%M", time.localtime(end)), host if e.get("host") else "(older session)",
+                length, v, f"{b['where']}, " + (f"{b['size'] / 1e9:.1f} GB" if b["size"] >= 1e9 else f"{b['size'] / 1e6:.0f} MB") if b else ""))
+        tree.pack(fill="both", expand=True)
+        if not rows:
+            ttk.Label(f, text="Nothing yet. Sessions show up here after someone presses Stop hosting.").pack(anchor="w")
+
+        def restore():
+            sel = tree.selection()
+            b = backups.get(int(sel[0])) if sel else None
+            if not b:
+                messagebox.showinfo("WorldBaton", "Pick a version that has a backup.")
+                return
+            if not messagebox.askyesno("Restore an earlier world", f"Bring back version {b['version']} for everyone?"
+                                       "\n\nThe current world isn't lost: it stays in the list (if it has a backup) "
+                                       "and in your Syncthing file versions. Everyone gets the restored world as a "
+                                       "new version.", icon="warning"):
+                return
+
+            def done(warning):
+                if warning:
+                    messagebox.showwarning("WorldBaton", warning)
+                messagebox.showinfo("WorldBaton", f"Version {b['version']} is back, shared as a new version. Keep "
+                                    "WorldBaton open until your friends show 100% synced.")
+                self.history_built = False
+                self.refresh_history()
+            self.tabs.select(self.body)
+            self.run_busy("Restoring the world…", lambda: self.group.restore_version(self.cfg["player"], b), done)
+        ttk.Button(bottom, text="Restore this version…", command=restore).pack(side="left")
+        ttk.Button(bottom, text="Refresh", command=lambda: (setattr(self, "history_built", False),
+                                                            self.refresh_history())).pack(side="left", padx=6)
+
     # --- helpers -----------------------------------------------------------------
     def copy(self, text):
         self.root.clipboard_clear()
@@ -568,6 +851,18 @@ class App:
         return win
 
     def on_close(self):
+        """The window's X: keep running in the tray (if that's on), so syncing and notifications carry on."""
+        if self.cfg["settings"]["tray"] and self.tray.icon:
+            self.root.withdraw()
+            if not self.cfg.get("told_tray"):
+                self.tray.notify("WorldBaton is still running", "It keeps syncing in the tray. Right-click the "
+                                 "icon to quit, or turn this off in Settings.")
+                self.cfg["told_tray"] = True
+                save_config(self.cfg)
+            return
+        self.quit()
+
+    def quit(self):
         s = getattr(self, "last_status", None)
         if s and s["me_hosting"]:
             if not messagebox.askyesno("WorldBaton", "You're hosting. If you close WorldBaton, friends can take over "
@@ -580,6 +875,7 @@ class App:
         self.shutdown()
 
     def shutdown(self):
+        self.tray.stop()
         if self.st:
             if self.group:
                 try:
@@ -708,7 +1004,7 @@ def main():
     except tk.TclError:
         pass  # missing icon file: keep the default rather than fail to start
     if accept_risk(root):
-        App(root)
+        App(root, hidden="--tray" in sys.argv)
         root.mainloop()
 
 

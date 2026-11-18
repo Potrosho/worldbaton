@@ -26,6 +26,8 @@ STALE_AFTER = 300      # seconds without a heartbeat before others may take over
 HEARTBEAT_EVERY = 30
 VERSION_FILE = ".worldbaton-version"
 KEEP_ACTIVITY = 500    # admin-log entries kept per PC
+KEEP_LOCAL = 2         # world backups each PC keeps for restoring, unless changed in Settings
+REQUEST_FOR = 3 * 3600  # a "can I host next?" request expires after this many seconds
 
 # Server log lines: NeoForge "[20Sep2026 11:57:08.841] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: msg",
 # vanilla "[11:57:08] [Server thread/INFO]: msg".
@@ -306,6 +308,28 @@ def watch_warnings(snapshot: dict) -> list[str]:
     return out
 
 
+def events(prev: dict | None, cur: dict, me: str) -> list[tuple[str, str]]:
+    """Notifications worth showing, from two status() snapshots taken a few seconds apart: (title, message)."""
+    if not prev:
+        return []  # first look after starting: nothing "happened" yet
+    out = []
+    was, now = prev.get("baton") or {}, cur.get("baton") or {}
+    holder, name = now.get("holder"), now.get("holder_name", "Someone")
+    if holder and holder != me and cur.get("holder_alive"):
+        if holder != was.get("holder"):
+            out.append((f"{name} is hosting", "They're getting the server ready."))
+        if now.get("server_up") and not (was.get("server_up") and holder == was.get("holder")):
+            out.append((f"{name}'s server is up", f"Join at {now['address']}" if now.get("address") else "Join now."))
+    old_holder = was.get("holder")
+    if old_holder and old_holder != me and not holder and prev.get("holder_alive"):
+        out.append((f"{was.get('holder_name', 'Someone')} stopped hosting",
+                    "You can host now." if cur.get("my_request") else "Their session is being shared."))
+    if cur.get("me_hosting"):
+        for asker in [r for r in cur.get("requests", []) if r not in prev.get("requests", [])]:
+            out.append((f"{asker} wants to host next", "Stop the server in SquidServers, then press Stop hosting."))
+    return out
+
+
 def file_marks(world_path: Path) -> dict:
     """Size and modified time of every synced file, to spot files changed outside the game."""
     world_path, out = Path(world_path), {}
@@ -439,43 +463,156 @@ class Group:
             except OSError:
                 pass  # backup folder unplugged/offline; Syncthing copy still works
 
-    # backups
-    def _zip(self, v: int) -> Path:
-        return self.backup_dir / f"{self.world_id}-v{v}.zip"
+    # backups: the shared backup folder (for groups never online together) and this PC's own copies (for restoring)
+    def _zip(self, v: int, folder: Path | None = None) -> Path:
+        return (folder or self.backup_dir) / f"{self.world_id}-v{v}.zip"
+
+    @property
+    def local_backup_dir(self) -> Path:
+        return self.app_dir / "backups"
+
+    @property
+    def keep_local(self) -> int:
+        """How many world backups this PC keeps for restoring (0 = off)."""
+        return int(self.info.get("local_backups", KEEP_LOCAL))
+
+    @staticmethod
+    def _zip_version(path: Path) -> int | None:
+        """The version a complete backup zip holds, or None if it's missing, broken or still uploading."""
+        try:
+            with zipfile.ZipFile(path) as z:
+                return int(z.read(VERSION_FILE).decode().strip())
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+            return None
 
     def backup_has(self, v: int) -> bool:
         """True if the backup folder holds a complete zip of version v (not still uploading)."""
-        if not self.backup_dir:
-            return False
-        try:
-            with zipfile.ZipFile(self._zip(v)) as z:
-                return z.read(VERSION_FILE).decode().strip() == str(v)
-        except (OSError, KeyError, zipfile.BadZipFile):
-            return False
+        return bool(self.backup_dir) and self._zip_version(self._zip(v)) == v
 
-    def save_backup(self, v: int) -> None:
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
-        part = self._zip(v).with_suffix(".zip.part")
+    def _write_zip(self, folder: Path, v: int, keep: int) -> None:
+        folder.mkdir(parents=True, exist_ok=True)
+        part = self._zip(v, folder).with_suffix(".zip.part")
         with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as z:
             for p in self.world_path.rglob("*"):
                 rel = p.relative_to(self.world_path).as_posix()
                 if p.is_file() and not skipped(rel):
                     z.write(p, rel)
-        os.replace(part, self._zip(v))
-        old = sorted(self.backup_dir.glob(f"{self.world_id}-v*.zip"), key=lambda p: int(p.stem.rsplit("-v", 1)[1]))
-        for p in old[:-KEEP_BACKUPS]:
+        os.replace(part, self._zip(v, folder))
+        old = sorted(folder.glob(f"{self.world_id}-v*.zip"), key=lambda p: int(p.stem.rsplit("-v", 1)[1]))
+        for p in old[:-keep]:
             p.unlink(missing_ok=True)
 
-    def restore_backup(self, v: int) -> None:
-        """Replace the synced files in the server folder with backup v. Per-PC files are left alone."""
+    def save_backup(self, v: int) -> None:
+        self._write_zip(self.backup_dir, v, KEEP_BACKUPS)
+
+    def save_local_backup(self, v: int) -> None:
+        self._write_zip(self.local_backup_dir, v, self.keep_local)
+
+    def backups(self) -> list[dict]:
+        """Complete backups this PC can restore from, newest first: version, path, where, size."""
+        found = {}
+        for where, folder in (("backup folder", self.backup_dir), ("this PC", self.local_backup_dir)):
+            if not folder or not folder.is_dir():
+                continue
+            for p in folder.glob(f"{self.world_id}-v*.zip"):
+                v = self._zip_version(p)
+                if v is not None:
+                    found[v] = {"version": v, "path": p, "where": where, "size": p.stat().st_size}
+        return sorted(found.values(), key=lambda b: b["version"], reverse=True)
+
+    def restore_zip(self, path: Path, v: int) -> None:
+        """Replace the synced files in the server folder with a backup. Per-PC files are left alone."""
         tmp = self.app_dir / "restore"
         shutil.rmtree(tmp, ignore_errors=True)
-        with zipfile.ZipFile(self._zip(v)) as z:
+        with zipfile.ZipFile(path) as z:
             z.extractall(tmp)  # extractall drops absolute paths and '..', so a bad zip can't write outside tmp
         if (tmp / VERSION_FILE).read_text().strip() != str(v):
             raise ValueError("The backup doesn't match its version number.")
         replace_synced_files(tmp, self.world_path, move=True)
         shutil.rmtree(tmp, ignore_errors=True)
+
+    def restore_backup(self, v: int) -> None:
+        self.restore_zip(self._zip(v), v)
+
+    def restore_version(self, player, backup: dict) -> str:
+        """Bring back an earlier world for everyone: take the baton, put the backup in place, share it as a new
+        version. Returns stop_hosting's warning ('' if none)."""
+        if server_running(self.world_path):
+            raise ValueError("Stop the server in SquidServers first.")
+        self.start_hosting(player, "")
+        try:
+            self.restore_zip(backup["path"], backup["version"])
+        except Exception as e:
+            self.discard_session()
+            self.write_baton({**self.read_baton(), "holder": None})
+            raise ValueError(f"Couldn't restore that backup: {e}")
+        return self.stop_hosting(player, restored_from=backup["version"])
+
+    # requests to host next: one small file per PC in the baton folder, so two requests never clash
+    def _request_file(self, device_id: str | None = None) -> Path:
+        return self.baton_file.parent / f"request-{(device_id or self.st.my_id)[:7]}.json"
+
+    def request_host(self, player) -> None:
+        self._write_json(self._request_file(), {"name": player, "t": time.time()})
+        self.st.scan(self.baton_id)
+
+    def cancel_request(self) -> None:
+        if self._request_file().exists():
+            self._request_file().unlink()
+            self.st.scan(self.baton_id)
+
+    def my_request(self) -> bool:
+        r = self._read_json(self._request_file())
+        return bool(r) and time.time() - r.get("t", 0) < REQUEST_FOR
+
+    def requests(self) -> list[str]:
+        """Names of other players asking to host next, oldest request first."""
+        mine = self._request_file().name
+        found = []
+        for p in self.baton_file.parent.glob("request-*.json"):
+            r = self._read_json(p)
+            if p.name != mine and r and time.time() - r.get("t", 0) < REQUEST_FOR:
+                found.append((r.get("t", 0), r.get("name", "Someone")))
+        return [name for _, name in sorted(found)]
+
+    # session history: also one file per PC
+    @property
+    def _history_file(self) -> Path:
+        return self.baton_file.parent / f"history-{self.st.my_id[:7]}.jsonl"
+
+    def history(self, limit=100) -> list[dict]:
+        entries = [e for p in self.baton_file.parent.glob("history-*.jsonl") for e in self.read_activity_file(p)]
+        return sorted(entries, key=lambda e: e.get("end", 0), reverse=True)[:limit]
+
+    def _add_history(self, entry: dict) -> None:
+        entries = (self.read_activity_file(self._history_file) + [entry])[-KEEP_ACTIVITY:]
+        tmp = self._history_file.with_suffix(".tmp")
+        tmp.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+        os.replace(tmp, self._history_file)
+
+    # group-wide settings (e.g. the Discord webhook), editable by anyone in the group
+    @property
+    def _settings_file(self) -> Path:
+        return self.baton_file.parent / "group-settings.json"
+
+    def group_settings(self) -> dict:
+        return self._read_json(self._settings_file) or {}
+
+    def set_group_setting(self, key, value) -> None:
+        self._write_json(self._settings_file, {**self.group_settings(), key: value})
+        self.st.scan(self.baton_id)
+
+    def update_server_up(self) -> str | None:
+        """While hosting: note in the baton whether the server is running, so friends can be told it's up.
+        Returns "up" or "down" when that just changed."""
+        baton = self.read_baton()
+        if not baton or baton.get("holder") != self.st.my_id:
+            return None
+        up = server_running(self.world_path)
+        if bool(baton.get("server_up")) == up:
+            return None
+        self.write_baton({**baton, "server_up": up})
+        return "up" if up else "down"
 
     def move_world(self, new_path) -> None:
         """Use another server folder (e.g. one the player made in SquidServers) for this group.
@@ -562,7 +699,8 @@ class Group:
         return {"baton": baton, "can_host": can and not lost, "reason": reason, "me_hosting": me_hosting, "lost_baton": lost,
                 "holder_alive": holder_alive(baton, now), "need_files": need, "need_bytes": fs.get("needBytes", 0),
                 "server_running": server_running(self.world_path), "members": members,
-                "conflicts": self.conflicts(), "local_version": self.local_version()}
+                "conflicts": self.conflicts(), "local_version": self.local_version(),
+                "requests": self.requests(), "my_request": self.my_request()}
 
     def conflicts(self) -> list[str]:
         return [p.name for p in self.baton_file.parent.glob("*.sync-conflict-*")]
@@ -738,8 +876,9 @@ class Group:
             except Exception as e:
                 self.st.set_folder(self.world_id, type="receiveonly", paused=False)
                 raise ValueError(f"Couldn't load the backup: {e}")
-        self.write_baton({**baton, "holder": self.st.my_id, "holder_name": player,
+        self.write_baton({**baton, "holder": self.st.my_id, "holder_name": player, "server_up": False,
                           "address": address.strip(), "heartbeat": time.time(), "since": time.time()})
+        self._request_file().unlink(missing_ok=True)  # got what was asked for
         self._skip_old_log()  # only report what happens from now on
         self._marks_file.unlink(missing_ok=True)
         self.watch_offline_edits(player)
@@ -754,7 +893,7 @@ class Group:
                                   f"⚠ WorldBaton wasn't running for {gap / 60:.0f} min while hosting.")])
             self.write_baton({**baton, "heartbeat": now})
 
-    def stop_hosting(self, player) -> str:
+    def stop_hosting(self, player, restored_from: int | None = None) -> str:
         """Share the session. Returns a warning for the player, or '' if all went well."""
         if server_running(self.world_path):
             raise ValueError("Stop the server in SquidServers first, then press Stop hosting.")
@@ -775,6 +914,18 @@ class Group:
                 self.save_backup(v)  # before the baton says v exists, so nobody looks for a zip that isn't there
             except OSError as e:
                 warning = f"Couldn't save to the backup folder ({e}). Friends can still get the world while you're online."
+        if self.keep_local:
+            try:
+                self.save_local_backup(v)
+            except OSError as e:
+                warning = (warning + "\n" if warning else "") + f"Couldn't save this PC's world backup ({e})."
+        entry = {"host": player, "start": baton.get("since", time.time()), "end": time.time(), "version": v}
+        if restored_from:
+            entry["restored_from"] = restored_from
+        try:
+            self._add_history(entry)
+        except OSError:
+            pass
         self.write_baton({"version": v, "holder": None, "last_host": self.st.my_id, "last_host_name": player})
         self.st.set_folder(self.world_id, type="sendreceive", paused=False)
         self.st.scan(self.world_id)

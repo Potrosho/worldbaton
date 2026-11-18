@@ -4,6 +4,19 @@ What changed in each version, in plain words. WorldBaton shows this in its *What
 update, and as the notes of each GitHub release. Every release needs a section here (the release build checks).
 
 ## 0.4.0
+- Notifications: get told when someone starts hosting, when their server is up (with the address), when it's
+  your turn, and when the server changes. Turn them off in the new Settings tab.
+- WorldBaton can keep running in the tray when you close the window, and start with Windows, so friends can get
+  the world from you even when you didn't open it.
+- Ask to host next: while someone hosts, press "Ask to host next". They're told, and you're told when it's
+  your turn.
+- History tab: every session, who hosted and for how long. Your PC keeps the last 2 worlds you hosted, and
+  any version with a backup can be brought back for everyone.
+- Update my game's mods: copies the server's mods into your own Minecraft (normal launcher, CurseForge, Prism,
+  Modrinth...). Mods you added yourself stay.
+- Discord: paste a channel webhook in Settings and WorldBaton posts when someone's server is up and when they stop.
+- Before you host, WorldBaton checks for a nearly full drive and for a SquidServers server that was set up with a
+  different loader version than the group's.
 - New look: WorldBaton has its own logo, on the app, the taskbar and the window.
 - What's new: this list now lives in its own tab, and WorldBaton shows what changed once after each update.
 - Update prompts now say what the new version changes before you decide.

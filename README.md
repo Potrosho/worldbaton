@@ -38,6 +38,18 @@ WorldBaton checks for updates each time it opens and offers to install them.
 
 Friends see who is hosting and the address to join with.
 
+### Also in the app
+
+- **Notifications and tray:** told when someone starts hosting, when their server is up, when it's your turn
+  and when the server changes. WorldBaton can stay in the tray and start with Windows (Settings).
+- **Ask to host next** while someone else hosts; they're told, and you're told when it's your turn.
+- **History:** every session with who hosted and for how long. Each PC keeps its last 2 hosted worlds, and
+  any version with a backup can be restored for everyone.
+- **Update my game's mods:** copies the server's mods into your own Minecraft; your own mods stay.
+- **Discord:** a channel webhook (set once for the whole group) gets "server is up" and "stopped" posts.
+- **Checks before hosting:** a nearly full drive, or a SquidServers server set up with a different loader version
+  than the group's. (Java, RAM and the player list stay SquidServers' job.)
+
 ### Never online at the same time? Add a backup folder
 
 Normally the world goes straight from PC to PC, so two PCs need to be on together.
@@ -94,7 +106,7 @@ If your PC crashes while hosting, reopen WorldBaton: as long as nobody took over
 ## Development
 
 ```bash
-pip install sv-ttk
+pip install sv-ttk pystray pillow
 ```
 
 ```bash
