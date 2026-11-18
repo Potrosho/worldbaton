@@ -11,6 +11,12 @@ Works with [SquidServers](https://squidservers.com) server folders and plain ser
 folders. **WorldBaton is not made by or affiliated with SquidServers / Aqura LLC**, and
 it doesn't modify their app: it only syncs your server folder.
 
+> **Only use WorldBaton with people you would trust with full access to your computer.**
+> Everyone in a group can put files on everyone else's PC: mods, configs, scripts, anything in the server folder.
+> Mods are programs, so a harmful one runs with your access when you host the server or copy it into your own
+> Minecraft. WorldBaton can't tell whether a file is safe; its change notices and activity list only help you
+> notice things. The app asks everyone to accept this the first time they open it.
+
 ## Download
 
 Get `WorldBaton.exe` from the [latest release](https://github.com/Potrosho/worldbaton/releases/latest).

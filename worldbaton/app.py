@@ -92,6 +92,8 @@ class App:
     # --- screens -----------------------------------------------------------------
     GUIDE = [
         ("h", "Before you start"),
+        ("p", "• Only use WorldBaton with people you'd trust with full access to your computer. Anyone in your group "
+              "can put mods and files on your PC, and mods are programs that run when you host or play with them."),
         ("p", "• Everyone who wants to take turns hosting needs WorldBaton and SquidServers. "
               "Friends who only play just need Minecraft."),
         ("p", "• Make a copy of your server folder before the first time, just in case."),
@@ -594,13 +596,59 @@ class App:
         poll()
 
 
+RISK_VERSION = 1  # raise to show the agreement to everyone again after changing it
+RISK_TEXT = (
+    "WorldBaton keeps a copy of your group's server folder on this PC and keeps it in sync with everyone in the "
+    "group. That means anyone in your group can put files on your computer: mods, configs, scripts, anything in "
+    "the server folder.\n\n"
+    "Minecraft mods are programs. A harmful mod or file from someone in your group would run on this PC when you "
+    "host the server, or when you copy the server's mods into your own Minecraft. It would have the same access "
+    "you have: your files, your accounts, your passwords.\n\n"
+    "WorldBaton can't tell whether a mod or file is safe. Its change notices and Host activity help you notice "
+    "things; they don't stop them.\n\n"
+    "Only create or join a group with people you would trust with full access to your computer, and with your "
+    "server and world.")
+
+
+def accept_risk(root) -> bool:
+    """First-run agreement that can't be skipped. Nothing starts (so nothing syncs) until it's accepted."""
+    if load_config().get("accepted_risk", 0) >= RISK_VERSION:
+        return True
+    root.title("WorldBaton: before you start")
+    answer = tk.StringVar()
+    root.protocol("WM_DELETE_WINDOW", lambda: answer.set("quit"))
+    f = ttk.Frame(root, padding=20)
+    f.pack(fill="both", expand=True)
+    ttk.Label(f, text="Only use WorldBaton with people you fully trust", font=("Segoe UI", 14, "bold"),
+              wraplength=500).pack(anchor="w")
+    ttk.Label(f, text=RISK_TEXT, wraplength=500, justify="left").pack(anchor="w", pady=(10, 14))
+    understood = tk.BooleanVar()
+    row = ttk.Frame(f)
+    go = ttk.Button(row, text="Continue", style="Accent.TButton", state="disabled", command=lambda: answer.set("ok"))
+    ttk.Checkbutton(f, text="I understand, and I'll only use it with people I trust this much.", variable=understood,
+                    command=lambda: go.config(state="normal" if understood.get() else "disabled")).pack(anchor="w")
+    row.pack(anchor="e", pady=(14, 0))
+    ttk.Button(row, text="Quit", command=lambda: answer.set("quit")).pack(side="left", padx=(0, 6))
+    go.pack(side="left")
+    root.wait_variable(answer)
+    if answer.get() != "ok":
+        root.destroy()
+        return False
+    f.destroy()
+    cfg = load_config()
+    cfg["accepted_risk"] = RISK_VERSION
+    save_config(cfg)
+    return True
+
+
 def main():
     root = tk.Tk()
     sv_ttk.set_theme("dark", root)
     root.tk.call("configure_colors")  # Tk 9 doesn't fire the theme's <<ThemeChanged>> hook, leaving pages light
     dark_title_bar(root)
-    App(root)
-    root.mainloop()
+    if accept_risk(root):
+        App(root)
+        root.mainloop()
 
 
 if __name__ == "__main__":
