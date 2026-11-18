@@ -12,10 +12,10 @@ class Updater(unittest.TestCase):
         self.assertEqual(updater.parse("garbage"), ())
 
     def test_latest_picks_newer_release_only(self):
-        rel = {"tag_name": "v9.0.0", "assets": [{"name": "WorldBaton.exe", "browser_download_url": "https://x/exe"}]}
+        rel = {"tag_name": "v9.0.0", "body": "- Faster sync\n", "assets": [{"name": "WorldBaton.exe", "browser_download_url": "https://x/exe"}]}
         with mock.patch("worldbaton.updater.urllib.request.urlopen") as op, mock.patch("json.load", return_value=rel):
             op.return_value.__enter__.return_value = None
-            self.assertEqual(updater.latest(), ("v9.0.0", "https://x/exe"))
+            self.assertEqual(updater.latest(), ("v9.0.0", "https://x/exe", "- Faster sync"))
             rel["tag_name"] = "v0.0.1"
             self.assertIsNone(updater.latest())
 

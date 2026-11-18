@@ -119,8 +119,10 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 ### Publishing a release
 
-1. Change `__version__` in `worldbaton/__init__.py` (e.g. `0.2.0`) and commit.
-2. Tag and push:
+1. Add a `## 0.2.0` section to `CHANGELOG.md` saying what changed, in plain words. It becomes the
+   release notes, the update prompt and the app's *What's new* (the release fails without it).
+2. Change `__version__` in `worldbaton/__init__.py` (e.g. `0.2.0`) and commit.
+3. Tag and push:
 
 ```bash
 git tag v0.2.0

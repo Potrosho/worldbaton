@@ -24,14 +24,14 @@ def can_update() -> bool:
     return bool(getattr(sys, "frozen", False))  # only the packaged .exe replaces itself
 
 
-def latest() -> tuple[str, str] | None:
-    """(tag, download url) of a release newer than this one, or None."""
+def latest() -> tuple[str, str, str] | None:
+    """(tag, download url, release notes) of a release newer than this one, or None."""
     req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest", headers=HEADERS)
     with urllib.request.urlopen(req, timeout=10) as r:
         rel = json.load(r)
     url = next((a["browser_download_url"] for a in rel.get("assets", []) if a["name"] == ASSET), None)
     if url and parse(rel["tag_name"]) > parse(__version__):
-        return rel["tag_name"], url
+        return rel["tag_name"], url, (rel.get("body") or "").strip()
     return None
 
 

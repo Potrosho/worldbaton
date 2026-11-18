@@ -11,7 +11,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import sv_ttk
 
-from . import __version__, core, updater
+from . import __version__, changelog, core, updater
 from .syncthing import Syncthing
 
 APP_DIR = Path(os.environ.get("WORLDBATON_HOME") or Path(os.environ.get("APPDATA", Path.home())) / "WorldBaton")
@@ -37,9 +37,12 @@ def save_config(cfg: dict) -> None:
 def dark_title_bar(win) -> None:
     """Make the Windows title bar dark to match the theme (Windows 10 20H1+ and 11; ignored elsewhere)."""
     try:
-        win.update_idletasks()
+        win.update()  # a pop-up's outer frame (which owns the title bar) only exists once it's on screen
         hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(1)), 4)
+        if win.winfo_ismapped():  # Windows only repaints the title bar when the window is redrawn
+            win.withdraw()
+            win.deiconify()
     except Exception:
         pass
 
@@ -55,9 +58,12 @@ class App:
         self.tabs.pack(fill="both", expand=True)
         self.body = ttk.Frame(self.tabs, padding=16)
         self.guide = ttk.Frame(self.tabs, padding=16)
+        self.news = ttk.Frame(self.tabs, padding=16)
         self.tabs.add(self.body, text="My group")
         self.tabs.add(self.guide, text="Setup guide")
+        self.tabs.add(self.news, text="What's new")
         self.build_guide()
+        self.root.after(300, self.show_whats_new)
         ttk.Label(self.body, text="Starting sync engine…").pack()
         self.error = None
         threading.Thread(target=self._start_engine, daemon=True).start()
@@ -134,23 +140,68 @@ class App:
         ("p", "• After Stop hosting, wait until the drive app says it's up to date before turning off your PC."),
     ]
 
-    def build_guide(self):
-        g = self.guide
-        text = tk.Text(g, wrap="word", relief="flat", padx=4, pady=4, height=18,
+    def page(self, parent, items, height=18):
+        """Read-only scrolling text: items are ("h", heading) and ("p", paragraph) pairs."""
+        text = tk.Text(parent, wrap="word", relief="flat", padx=4, pady=4, height=height,
                        background=self.root.cget("background"), font=("Segoe UI", 10))
-        bar = ttk.Scrollbar(g, command=text.yview)
+        bar = ttk.Scrollbar(parent, command=text.yview)
         text.config(yscrollcommand=bar.set)
         text.tag_config("h", font=("Segoe UI", 11, "bold"), spacing1=10, spacing3=4)
         text.tag_config("p", lmargin1=4, lmargin2=18, spacing3=3)
-        for tag, line in self.GUIDE:
+        for tag, line in items:
             text.insert("end", line + "\n", tag)
         text.config(state="disabled")
-        foot = ttk.Frame(g)
+        bar.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+
+    @staticmethod
+    def changes_page(sections):
+        items = []
+        for version, changes in sections:
+            now = " (this version)" if updater.parse(version) == updater.parse(__version__) else ""
+            items += [("h", f"WorldBaton {version}{now}")] + [("p", f"• {c}") for c in changes]
+        return items or [("p", "No changes listed.")]
+
+    def build_guide(self):
+        foot = ttk.Frame(self.guide)
         foot.pack(side="bottom", fill="x", pady=(8, 0))
         ttk.Label(foot, text=f"WorldBaton {__version__}", foreground="#a0a0a0").pack(side="left")
         ttk.Button(foot, text="Check for updates", command=lambda: self.check_updates(manual=True)).pack(side="right")
-        bar.pack(side="right", fill="y")
-        text.pack(side="left", fill="both", expand=True)
+        self.page(self.guide, self.GUIDE)
+        # versions newer than this one (a source checkout's next release) aren't "what's new" yet
+        released = [s for s in changelog.load() if updater.parse(s[0]) <= updater.parse(__version__)]
+        self.page(self.news, self.changes_page(released))
+
+    def show_whats_new(self):
+        """Once after an update: what changed since the version this PC ran before."""
+        last = self.cfg.get("last_version")
+        self.cfg["last_version"] = __version__
+        save_config(self.cfg)
+        if last == __version__ or not self.cfg.get("player"):
+            return  # same version, or a brand-new install (the setup guide comes first)
+        sections = changelog.between(changelog.load(), last or "0", __version__)
+        if not last:  # updated from a version before this existed: just this version's changes
+            sections = sections[:1]
+        if not sections:
+            return
+        win = tk.Toplevel(self.root)
+        win.title("WorldBaton")
+        win.minsize(460, 320)
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=f"What's new in WorldBaton {__version__}", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Button(frame, text="Got it", style="Accent.TButton", command=win.destroy).pack(side="bottom", anchor="e",
+                                                                                         pady=(10, 0))
+        body = ttk.Frame(frame)
+        body.pack(fill="both", expand=True, pady=(6, 0))
+        self.page(body, self.changes_page(sections), height=12)
+        win.transient(self.root)
+        self.popup(win)
+
+    def popup(self, win):
+        """Show a pop-up over the main window with a dark title bar. Call last: it puts the window on screen."""
+        win.geometry(f"+{self.root.winfo_rootx() + 40}+{self.root.winfo_rooty() + 40}")
+        dark_title_bar(win)
 
     def clear(self):
         for w in self.body.winfo_children():
@@ -507,13 +558,13 @@ class App:
     def code_dialog(self, label, code):
         win = tk.Toplevel(self.root)
         win.title("WorldBaton")
-        dark_title_bar(win)
         ttk.Label(win, text=label, wraplength=420).pack(anchor="w", padx=12, pady=(12, 4))
         e = ttk.Entry(win, width=60)
         e.insert(0, code)
         e.config(state="readonly")
         e.pack(padx=12, fill="x")
         ttk.Button(win, text="Copy", command=lambda: self.copy(code)).pack(pady=(6, 0))
+        self.popup(win)
         return win
 
     def on_close(self):
@@ -567,14 +618,17 @@ class App:
                 messagebox.showinfo("WorldBaton", f"You're up to date (WorldBaton {__version__}).")
         poll()
 
-    def offer_update(self, tag, url):
+    def offer_update(self, tag, url, notes=""):
         s = getattr(self, "last_status", None)
         if s and s["me_hosting"]:
             messagebox.showinfo("WorldBaton", f"WorldBaton {tag} is out. It'll offer to update next time you open it "
                                 "when you're not hosting.")
             return
-        if not messagebox.askyesno("WorldBaton", f"WorldBaton {tag} is out (you have {__version__}).\n"
-                                   "Update now? WorldBaton will restart."):
+        lines = [ln for ln in notes.splitlines() if ln.strip()]
+        shown = "\n".join(lines[:10]) + ("\n..." if len(lines) > 10 else "")
+        if not messagebox.askyesno("WorldBaton", f"WorldBaton {tag} is out (you have {__version__}).\n\n"
+                                   + (f"What's new:\n{shown}\n\n" if shown else "")
+                                   + "Update now? WorldBaton will restart."):
             return
         done = {}
 
