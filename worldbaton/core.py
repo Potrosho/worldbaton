@@ -267,6 +267,27 @@ def server_running(world_path: Path) -> bool:
     return server_state(world_path).get("status") == "online" and server_pid(world_path) is not None
 
 
+def rolled_log_rest(logs: Path, prev: dict) -> list[str] | None:
+    """The unread lines of a log the server moved aside while running, if one of the recently moved logs is the
+    file WorldBaton was reading (same bytes where it stopped). None if none is."""
+    recent = []
+    for p in logs.glob("*.log*"):
+        try:
+            if p.name not in ("latest.log", "debug.log") and time.time() - p.stat().st_mtime < 1800:
+                recent.append((p.stat().st_mtime, p))
+        except OSError:
+            pass
+    start = prev["pos"] - len(prev["tail"])
+    for _, p in sorted(recent, reverse=True)[:5]:
+        try:
+            data = gzip.decompress(p.read_bytes()) if p.suffix == ".gz" else p.read_bytes()
+        except (OSError, EOFError, gzip.BadGzipFile):
+            continue  # still being written
+        if len(data) >= prev["pos"] and data[start:prev["pos"]] == prev["tail"]:
+            return data[prev["pos"]:].decode("utf-8", "replace").splitlines()
+    return None
+
+
 def admin_line(line: str) -> tuple[str, str] | None:
     """(log time, what happened) if a server log line is an admin command, else None."""
     m = LOG_LINE.match(line.rstrip("\r\n"))
@@ -1027,7 +1048,7 @@ class Group:
         born = info.st_ino or getattr(info, "st_birthtime", info.st_ctime)
         pid = server_pid(self.world_path)
         prev = self._logs.get(name)
-        pos, warning = 0, None
+        pos, warning, rolled = 0, None, []
         with open(log, "rb") as f:
             if prev and prev["born"] == born:
                 f.seek(max(0, prev["pos"] - len(prev["tail"])))
@@ -1036,14 +1057,20 @@ class Group:
                 else:
                     pos = prev["pos"]
             elif prev and pid and prev["pid"] == pid:
-                warning = f"⚠ The server log ({name}) was replaced while the server kept running."
+                # Minecraft starts a new latest.log at midnight (debug.log at 200 MB) and keeps the old one as
+                # logs/<date>-1.log.gz. Fine if that file is the one we were reading.
+                rolled = rolled_log_rest(log.parent, prev)
+                if rolled is None:
+                    if time.time() - prev.setdefault("rolled_at", time.time()) < 120:
+                        return [], None  # the old log may still be being compressed: look again next time
+                    rolled, warning = [], f"⚠ The server log ({name}) was replaced while the server kept running."
             f.seek(pos)
             data = f.read()
             end = pos + data.rfind(b"\n") + 1  # leave a half-written last line for next time
             f.seek(max(0, end - 64))
             tail = f.read(end - max(0, end - 64))
         self._logs[name] = {"born": born, "pos": end, "tail": tail, "pid": pid}
-        return data[:end - pos].decode("utf-8", "replace").splitlines(), warning
+        return rolled + data[:end - pos].decode("utf-8", "replace").splitlines(), warning
 
     def _skip_old_log(self) -> None:
         self._logs = {}

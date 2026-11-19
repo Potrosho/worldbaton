@@ -3,6 +3,11 @@
 What changed in each version, in plain words. WorldBaton shows this in its *What's new* tab, after each
 update, and as the notes of each GitHub release. Every release needs a section here (the release build checks).
 
+## 0.6.1
+- Fixed a false "The server log was replaced while the server kept running" warning at midnight. Minecraft starts a
+  new log each day while the server runs; WorldBaton now reads the end of the old one, so commands typed just
+  before midnight still show up in Host activity.
+
 ## 0.6.0
 - Cloud copy: put the world in free S3 storage such as Cloudflare R2 or Backblaze B2 (Settings → Cloud copy,
   set once for the whole group). Each Stop hosting uploads it, so anyone in the group can get the newest world

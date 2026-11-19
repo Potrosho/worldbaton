@@ -4,6 +4,7 @@ import json
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from worldbaton import core
@@ -140,6 +141,29 @@ class Hosting(unittest.TestCase):
             g.record_activity("Sam")
             texts = [e["text"] for e in g.activity()]
         self.assertEqual(texts, ["Console: Made Sam a server operator"])
+
+    def test_log_rolled_at_midnight(self):
+        """The server keeps running past midnight: Minecraft gzips latest.log into logs/<date>-1.log.gz and starts a
+        new one. Not a warning, and lines written just before midnight still count. A swapped-in log still warns."""
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(core, "server_pid", return_value=4242):
+            g = make_group(Path(d))
+            log = g.world_path / "logs" / "latest.log"
+            log.write_text(NEO + "Sam joined the game\n")
+            g._skip_old_log()
+            with open(log, "a") as f:
+                f.write(NEO + "Made Sam a server operator\n")  # 23:59:58, not read yet
+            old = log.read_bytes()
+            log.unlink()
+            log.write_text(NEO + "[Sam: Gave 1 [Diamond] to Sam]\n")
+            self.assertEqual(g._new_log_lines("latest.log"), ([], None))  # not compressed yet: wait
+            (log.parent / "2026-11-18-1.log.gz").write_bytes(gzip.compress(old))
+            g.record_activity("Sam")
+            self.assertEqual(sorted(e["text"] for e in g.activity()),
+                             ["Console: Made Sam a server operator", "Sam: Gave 1 [Diamond] to Sam"])
+            log.unlink()  # now a log that isn't the one we were reading
+            log.write_text(NEO + "Sam left the game\n")
+            g._logs["latest.log"]["rolled_at"] = time.time() - 200
+            self.assertIn("was replaced", g._new_log_lines("latest.log")[1])
 
     def test_files_edited_while_server_off(self):
         with tempfile.TemporaryDirectory() as d:
