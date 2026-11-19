@@ -3,6 +3,16 @@
 What changed in each version, in plain words. WorldBaton shows this in its *What's new* tab, after each
 update, and as the notes of each GitHub release. Every release needs a section here (the release build checks).
 
+## 0.5.0
+- Joining is easier: the owner picks a group password, then sends friends the group code and the password. Friends
+  paste both and are let in on their own while the owner's WorldBaton is open (the tray is enough). No more
+  sending a code back. Typed it wrong? Press "Enter the password again".
+- The owner can remove a friend from a group (Remove a friend...). Everyone's PC stops syncing with theirs, and
+  they can't come back, even with the password. They keep the copy of the world they already have.
+- After 10 wrong passwords in an hour, nobody can join for an hour, and the owner is told.
+- Groups you're already in keep working as they are. Owners of older groups pick a password the next time they
+  press Invite a friend. Group codes from older versions don't work anymore: ask for a new one.
+
 ## 0.4.0
 - Multiple groups: be in several groups at once and switch between them at the top of My group. Every group
   keeps syncing in the background, each has its own tunnel address, and you can leave a group (its

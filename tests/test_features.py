@@ -149,6 +149,68 @@ class ConfigUpgrade(unittest.TestCase):
         self.assertEqual(upgrade_config(dict(cfg)), cfg, "upgrading twice changes nothing")
 
 
+class JoiningWithAPassword(unittest.TestCase):
+    """The owner's side of core.admit, with a pretend Syncthing (test_two_pcs runs the real thing)."""
+
+    class Owner:
+        my_id = "ALEX"
+
+        def __init__(self, pending):
+            self.pending, self.shared = pending, {}
+
+        def devices(self):
+            return {"ALEX": "Alex"}
+
+        def get(self, path):
+            return self.pending if path.endswith("/devices") else {}
+
+        def delete(self, path):
+            self.pending.pop(path.rsplit("device=", 1)[1], None)
+
+        def folder(self, folder_id):
+            return {"devices": [{"deviceID": d} for d in self.shared.get(folder_id, [])]}
+
+    def group(self, st, world_id, password):
+        g = core.Group(st, {"world_id": world_id, "baton_id": world_id + "b", "world_path": "x", "owner": "ALEX"},
+                       Path(tempfile.mkdtemp()))
+        g.set_password(password)
+        g.add_member = lambda dev, name: st.shared.setdefault(world_id, []).append(dev)
+        return g
+
+    def test_right_wrong_removed_and_too_many_guesses(self):
+        key = core.group_key("hunter22", "big")
+        st = self.Owner({"SAM": {"name": core.with_proofs("Sam", ["0" * 16, core.make_proof(key, "SAM")])},
+                         "KIM": {"name": core.with_proofs("Kim", [core.make_proof(key, "SAM")])},  # copied Sam's proof
+                         "EVE": {"name": core.with_proofs("Eve", [core.make_proof(key, "EVE")])},
+                         "RANDO": {"name": "Some PC"}})
+        big, other = self.group(st, "big", "hunter22"), self.group(st, "other", "letmein")
+        big.info["removed"] = ["EVE"]
+        refused = {}
+        let_in, wrong = core.admit(st, [big, other], refused, now=1000)
+        self.assertEqual([(g.world_id, n) for g, n in let_in], [("big", "Sam")])
+        self.assertEqual(wrong, ["Kim"], "a proof only works for the PC it was made for; Eve was removed, not wrong")
+        self.assertEqual(sorted(st.pending), ["EVE", "RANDO", "SAM"], "wrong attempts are dismissed in Syncthing")
+        st.pending["KIM"] = {"name": core.with_proofs("Kim", [core.make_proof(key, "SAM")])}  # Kim's PC knocks again
+        self.assertEqual(core.admit(st, [big, other], refused, now=1001), ([], []), "nothing twice")
+        with self.assertRaises(ValueError):
+            big.set_password("short")
+
+        st.pending = {f"GUESS{i}": {"name": core.with_proofs("X", [f"{i:016x}"])} for i in range(20)}
+        core.admit(st, [big], refused, now=1002)
+        self.assertEqual(len(refused), core.GUESSES_PER_HOUR, "stops looking once it's paused")
+        st.pending["SAM2"] = {"name": core.with_proofs("Sam", [core.make_proof(key, "SAM2")])}
+        self.assertEqual(core.admit(st, [big], refused, now=1003), ([], []), "paused for an hour")
+        self.assertEqual(core.admit(st, [big], refused, now=1002 + 3601), ([], ["X"] * 10),
+                         "the next hour's 10 guesses are the other 10 waiting")
+        self.assertEqual(len(core.admit(st, [big], refused, now=1002 + 7202)[0]), 1, "then people get in again")
+
+    def test_only_the_owner_lets_people_in(self):
+        st = self.Owner({"SAM": {"name": "Sam [wb:abc]"}})
+        g = self.group(st, "big", "hunter22")
+        g.info["owner"] = "SOMEONE-ELSE"
+        self.assertEqual(core.admit(st, [g], {}), ([], []))
+
+
 class Discord(unittest.TestCase):
     def test_only_webhook_links(self):
         self.assertTrue(tools.valid_webhook("https://discord.com/api/webhooks/123456/abc-DEF_9"))

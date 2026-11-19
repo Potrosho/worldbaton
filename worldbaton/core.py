@@ -13,6 +13,8 @@ import base64
 import ctypes
 import fnmatch
 import gzip
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -78,8 +80,11 @@ def _enc(prefix: str, data: dict) -> str:
 
 def _dec(prefix: str, code: str) -> dict:
     code = code.strip()
+    if code.startswith("WBI1-"):
+        raise ValueError("That group code is from an older WorldBaton. Ask your friend to open WorldBaton "
+                         "(it updates itself) and send you the new group code and password.")
     if not code.startswith(prefix):
-        raise ValueError(f"That isn't a WorldBaton {'invite' if prefix == 'WBI1-' else 'join'} code.")
+        raise ValueError("That isn't a WorldBaton group code.")
     raw = code[len(prefix):]
     try:
         return json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
@@ -88,25 +93,86 @@ def _dec(prefix: str, code: str) -> dict:
 
 
 def encode_invite(owner_id, owner_name, group, world_id, baton_id) -> str:
-    return _enc("WBI1-", {"o": owner_id, "on": owner_name, "g": group, "w": world_id, "b": baton_id})
+    return _enc("WBI2-", {"o": owner_id, "on": owner_name, "g": group, "w": world_id, "b": baton_id})
 
 
 def decode_invite(code: str) -> dict:
-    d = _dec("WBI1-", code)
+    d = _dec("WBI2-", code)
     if not all(isinstance(d.get(k), str) and d[k] for k in ("o", "on", "g", "w", "b")):
-        raise ValueError("The invite code is missing information.")
+        raise ValueError("The group code is missing information.")
     return d
 
 
-def encode_join(device_id, name) -> str:
-    return _enc("WBJ1-", {"d": device_id, "n": name})
+# --- joining with a password -----------------------------------------------------------
+# A joining PC proves it knows the password without sending it: an HMAC of its own Syncthing ID, keyed by the
+# password. It travels in the PC's name (seen by the owner's Syncthing as a "pending device") and in the folder
+# names it offers (seen as "pending folders" when the owner already knows that PC from another group).
+PROOF = re.compile(r"\s*\[wb:([0-9a-f,]*)\]")
+MIN_PASSWORD = 6
+GUESSES_PER_HOUR = 10  # wrong-password attempts before the owner's WorldBaton stops letting anyone in for an hour
 
 
-def decode_join(code: str) -> dict:
-    d = _dec("WBJ1-", code)
-    if not (isinstance(d.get("d"), str) and isinstance(d.get("n"), str)):
-        raise ValueError("The join code is missing information.")
-    return d
+def group_key(password: str, world_id: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), world_id.encode(), 200_000).hex()
+
+
+def make_proof(key: str, device_id: str) -> str:
+    return hmac.new(bytes.fromhex(key), device_id.encode(), "sha256").hexdigest()[:16]
+
+
+def proofs_in(text: str) -> list[str]:
+    m = PROOF.search(text or "")
+    return [p for p in m.group(1).split(",") if p] if m else []
+
+
+def plain_name(name: str) -> str:
+    return PROOF.sub("", name or "").strip()
+
+
+def with_proofs(name: str, proofs) -> str:
+    proofs = list(proofs)
+    return f"{plain_name(name)} [wb:{','.join(proofs)}]".strip() if proofs else plain_name(name)
+
+
+def admit(st, groups, refused: dict, now=None) -> tuple[list, list]:
+    """On the owner's PC: let in every PC that proved it knows one of this PC's groups' passwords.
+    refused remembers wrong attempts ({(device, proofs): time}); too many in an hour and nobody is let in.
+    Returns ([(group, name) let in], [names that just tried a wrong password])."""
+    now = now or time.time()
+    owned = [g for g in groups if g.is_owner() and g.info.get("key")]
+    if not owned:
+        return [], []
+    for k in [k for k, t in refused.items() if now - t > 3600]:
+        del refused[k]
+    known = st.devices()
+    asks = [(dev, d.get("name", ""), d.get("name", ""), None)
+            for dev, d in (st.get("/rest/cluster/pending/devices") or {}).items()]
+    ours = {fid for g in owned for fid in (g.world_id, g.baton_id)}
+    for fid, f in (st.get("/rest/cluster/pending/folders") or {}).items():
+        if fid in ours:
+            asks += [(dev, known.get(dev, ""), d.get("label", ""), fid) for dev, d in f.get("offeredBy", {}).items()]
+    let_in, wrong = [], []
+    for dev, name, text, fid in asks:
+        if len(refused) >= GUESSES_PER_HOUR:
+            break  # paused
+        proofs = proofs_in(text)
+        if not proofs:
+            continue  # not someone joining with WorldBaton
+        name = plain_name(name) or "A friend"
+        hits = [g for g in owned if fid in (None, g.world_id, g.baton_id) and make_proof(g.info["key"], dev) in proofs]
+        for g in hits:
+            if dev not in g.info.get("removed", []) and dev not in g.member_ids():
+                g.add_member(dev, name)
+                let_in.append((g, name))
+        attempt = (dev, ",".join(proofs))  # the same attempt shows up once per folder
+        if not hits:
+            # forget it in Syncthing too, so old attempts don't count again once the hour is up
+            st.delete(f"/rest/cluster/pending/devices?device={dev}" if fid is None else
+                      f"/rest/cluster/pending/folders?folder={fid}&device={dev}")
+            if attempt not in refused:
+                refused[attempt] = now
+                wrong.append(name)
+    return let_in, wrong
 
 
 def safe_folder_name(name: str) -> str:
@@ -418,30 +484,74 @@ class Group:
         return g
 
     @classmethod
-    def join(cls, st, app_dir, invite: dict, servers_dir: Path, joined=()):
+    def join(cls, st, app_dir, invite: dict, servers_dir: Path, password: str, player: str, joined=(), waiting=()):
+        """Set up this PC's copy and ask the owner to let it in. waiting: proofs of other groups still being joined."""
         if invite["w"] in joined:
             raise ValueError(f"You're already in {invite['g']}.")
         world_path = Path(servers_dir) / safe_folder_name(invite["g"])
         if world_path.exists() and any(world_path.iterdir()):
             raise ValueError(f"{world_path} already exists and isn't empty. Move or rename it first.")
         info = {"name": invite["g"], "world_id": invite["w"], "baton_id": invite["b"],
-                "world_path": str(world_path), "owner": invite["o"]}
+                "world_path": str(world_path), "owner": invite["o"], "owner_name": invite["on"]}
         g = cls(st, info, app_dir)
         world_path.mkdir(parents=True, exist_ok=True)
         g.baton_file.parent.mkdir(parents=True, exist_ok=True)
-        st.add_device(invite["o"], invite["on"], introducer=True)
-        st.add_folder(g.world_id, invite["g"], world_path, [invite["o"]], "receiveonly", versioning=True)
-        st.add_folder(g.baton_id, f"{invite['g']} (baton)", g.baton_file.parent, [invite["o"]])
+        st.add_folder(g.world_id, invite["g"], world_path, [], "receiveonly", versioning=True)
+        st.add_folder(g.baton_id, f"{invite['g']} (baton)", g.baton_file.parent, [])
         st.set_ignores(g.world_id, IGNORES)
+        g.set_join_password(password, player, waiting)
         return g
 
-    def invite_code(self, player) -> str:
-        return encode_invite(self.st.my_id, player, self.info["name"], self.world_id, self.baton_id)
+    def set_join_password(self, password: str, player: str, waiting=()) -> None:
+        """Put the proof of the password in this PC's name and in the folders it offers the owner, then offer them."""
+        self.info["proof"] = make_proof(group_key(password, self.world_id), self.st.my_id)
+        tag, owner = with_proofs("", [self.info["proof"]]), self.info["owner"]
+        self.st.set_name(with_proofs(player, [*waiting, self.info["proof"]]))  # before the owner is added: first hello
+        for folder_id, label in ((self.world_id, self.info["name"]), (self.baton_id, f"{self.info['name']} (baton)")):
+            self.st.unshare_folder(folder_id, owner)  # Syncthing only re-offers a renamed folder when its sharing changes
+            self.st.set_folder(folder_id, label=f"{label} {tag}")
+        if owner not in self.st.devices():
+            self.st.add_device(owner, self.info.get("owner_name", "Owner"), introducer=True)
+        else:  # known from another group: keep its addresses, but let it introduce this group's friends
+            self.st.patch(f"/rest/config/devices/{owner}", {"introducer": True})
+        self.st.share_folder(self.world_id, owner)
+        self.st.share_folder(self.baton_id, owner)
 
-    def add_member(self, join: dict) -> None:
-        self.st.add_device(join["d"], join["n"])
-        self.st.share_folder(self.world_id, join["d"])
-        self.st.share_folder(self.baton_id, join["d"])
+    def joined(self, player: str, waiting=()) -> None:
+        """The owner let this PC in: take the password proof back out of its names."""
+        self.info.pop("proof", None)
+        self.st.set_name(with_proofs(player, waiting))
+        self.st.set_folder(self.world_id, label=self.info["name"])
+        self.st.set_folder(self.baton_id, label=f"{self.info['name']} (baton)")
+
+    def is_owner(self) -> bool:
+        return self.info.get("owner") == self.st.my_id
+
+    def set_password(self, password: str) -> None:
+        if len(password) < MIN_PASSWORD:
+            raise ValueError(f"Use at least {MIN_PASSWORD} characters.")
+        self.info["password"], self.info["key"] = password, group_key(password, self.world_id)
+
+    def invite_code(self, owner_name) -> str:
+        return encode_invite(self.info["owner"], owner_name, self.info["name"], self.world_id, self.baton_id)
+
+    def member_ids(self) -> set[str]:
+        return {d["deviceID"] for d in self.st.folder(self.world_id)["devices"]} - {self.st.my_id}
+
+    def add_member(self, device_id: str, name: str) -> None:
+        if device_id not in self.st.devices():
+            self.st.add_device(device_id, name)
+        self.st.share_folder(self.world_id, device_id)
+        self.st.share_folder(self.baton_id, device_id)
+
+    def remove_member(self, device_id: str) -> None:
+        """Owner only: stop sharing this group with a PC. Everyone else drops it too (the owner introduced it),
+        and it isn't let back in, even with the password."""
+        self.info["removed"] = [*self.info.get("removed", []), device_id]
+        for folder_id in (self.world_id, self.baton_id):
+            self.st.unshare_folder(folder_id, device_id)
+        if not any(device_id == d["deviceID"] for f in self.st.get("/rest/config/folders") for d in f["devices"]):
+            self.st.remove_device(device_id)  # in no other group of this PC
 
     # files
     @staticmethod
@@ -707,12 +817,15 @@ class Group:
                 done = self.st.completion(self.world_id, dev_id)
             except Exception:
                 done = None
-            members.append({"id": dev_id, "name": name, "online": dev_id in online, "synced": done})
+            members.append({"id": dev_id, "name": plain_name(name) or "Friend", "online": dev_id in online, "synced": done})
         me_hosting = bool(baton and baton.get("holder") == self.st.my_id)
         try:
             lost = self.st.folder(self.world_id)["paused"] and not me_hosting
         except Exception:
             lost = False
+        if self.info.get("proof") and not baton:
+            reason = (f"Waiting for {self.info.get('owner_name', 'the owner')} to let you in. Their WorldBaton needs to "
+                      "be open (the tray is enough). If nothing happens, check the password with them.")
         return {"baton": baton, "can_host": can and not lost, "reason": reason, "me_hosting": me_hosting, "lost_baton": lost,
                 "holder_alive": holder_alive(baton, now), "need_files": need, "need_bytes": fs.get("needBytes", 0),
                 "server_running": server_running(self.world_path), "members": members,

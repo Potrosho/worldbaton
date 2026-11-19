@@ -2,6 +2,7 @@
 import ctypes
 import json
 import os
+import secrets
 import sys
 import threading
 import time
@@ -66,6 +67,7 @@ class App:
         upgrade_config(self.cfg)
         self.groups: list[core.Group] = []
         self.statuses = {}  # world_id -> that group's latest status()
+        self.refused = {}  # wrong-password attempts to join this PC's groups, see core.admit
         self.busy = False
         self.notified_changes = self.activity_shown = None
         root.title(f"WorldBaton {__version__}")
@@ -119,7 +121,6 @@ class App:
             name = simpledialog.askstring("WorldBaton", "Your name (friends will see this):", parent=self.root)
             self.cfg["player"] = (name or os.environ.get("USERNAME") or "Player").strip()[:32]
             save_config(self.cfg)
-        self.st.set_name(self.cfg["player"])
         for info in self.cfg["groups"]:
             g = core.Group(self.st, info, APP_DIR)
             self.groups.append(g)
@@ -127,12 +128,17 @@ class App:
                 self.st.set_ignores(g.world_id, core.IGNORES)  # groups made by older versions get new rules
             except Exception:
                 pass
+        self.st.set_name(core.with_proofs(self.cfg["player"], self.waiting_proofs()))
         self.group = next((g for g in self.groups if g.world_id == self.cfg.get("active")),
                           self.groups[0] if self.groups else None)
         self.show()
         self.tick()  # these two run for as long as WorldBaton does, for every group
         self.beat()
         self.check_updates()
+
+    def waiting_proofs(self, but=None) -> list[str]:
+        """Password proofs of the groups this PC is still waiting to be let into."""
+        return [g.info["proof"] for g in self.groups if g.info.get("proof") and g is not but]
 
     def switch_to(self, g):
         self.group = g
@@ -182,11 +188,12 @@ class App:
         ("p", "1. Stop your server in SquidServers."),
         ("p", "2. In My group, press Create a group from my server and pick your server folder "
               "(SquidServers keeps them in %LOCALAPPDATA%\\SquidServers)."),
-        ("p", "3. Press Invite a friend and send them the invite code."),
-        ("p", "4. Paste the join code they send back and press Add friend."),
+        ("p", "3. Pick a password, then send friends the group code and the password. Your WorldBaton lets them in "
+              "on its own while it's open (the tray is enough)."),
+        ("p", "4. To remove someone, press Remove a friend…. They can't come back, even with the password."),
         ("h", "Joining a friend's group"),
-        ("p", "1. Press Join a friend's group and paste their invite code."),
-        ("p", "2. Send the join code WorldBaton shows back to your friend."),
+        ("p", "1. Press Join a friend's group, paste their group code and type the password."),
+        ("p", "2. Your friend's WorldBaton lets you in as soon as it's open. Typo? Press Enter the password again…."),
         ("p", "3. Wait for the world to copy over (your friend's list shows you at 100%)."),
         ("p", "4. In SquidServers, create a new server with the SAME type and Minecraft version as the group's "
               "(for example NeoForge 1.21.1) and a different name. Don't add mods. Let it install, then keep it stopped."),
@@ -374,14 +381,21 @@ class App:
             w.pack(side="left", padx=(0, 6))
         row2 = ttk.Frame(b)
         row2.pack(fill="x", pady=(6, 0))
-        ttk.Button(row2, text="Invite a friend", command=self.invite).pack(side="left", padx=(0, 6))
+        if self.group.info.get("proof"):
+            ttk.Button(row2, text="Enter the password again…", command=self.retry_password).pack(side="left", padx=(0, 6))
+        else:
+            ttk.Button(row2, text="Invite a friend", command=self.invite).pack(side="left", padx=(0, 6))
         ttk.Button(row2, text="Open server folder", command=lambda: os.startfile(self.group.world_path)).pack(side="left", padx=(0, 6))
         ttk.Button(row2, text="Backup folder…", command=self.pick_backup).pack(side="left", padx=(0, 6))
         ttk.Button(row2, text="Change server folder…", command=self.change_folder).pack(side="left", padx=(0, 6))
         ttk.Button(row2, text="My address…", command=self.ask_address).pack(side="left")
         self.backup_label = ttk.Label(b, wraplength=440, foreground="#a0a0a0")
         self.backup_label.pack(anchor="w", pady=(8, 0))
-        ttk.Button(b, text="Leave this group…", command=self.leave_group).pack(anchor="w", pady=(6, 0))
+        last = ttk.Frame(b)
+        last.pack(fill="x", pady=(6, 0))
+        if self.group.is_owner():
+            ttk.Button(last, text="Remove a friend…", command=self.remove_friend).pack(side="left", padx=(0, 6))
+        ttk.Button(last, text="Leave this group…", command=self.leave_group).pack(side="left")
         self.show_backup()
         if self.group.world_id in self.statuses:
             self.render(self.statuses[self.group.world_id])  # don't wait for the next refresh after switching
@@ -392,6 +406,7 @@ class App:
         if not self.busy:  # never reconcile while a restore/backup is touching a server folder
             for g in list(self.groups):
                 self.watch_group(g)
+            self.admit_friends()
             s = self.statuses.get(self.group.world_id) if self.group else None
             if s and getattr(self, "headline", None) and self.headline.winfo_exists():
                 self.render(s)
@@ -406,6 +421,15 @@ class App:
                 self.reason.config(text=f"Sync engine busy ({e}). Retrying…")
             return
         player, name = self.cfg["player"], g.info["name"]
+        if g.info.get("proof") and s["baton"]:  # the owner let this PC in
+            try:
+                g.joined(player, self.waiting_proofs(but=g))
+                save_config(self.cfg)
+                self.notify(f"You're in {name}", "The world is copying to this PC.")
+                if g is self.group:
+                    self.show()
+            except Exception:
+                pass
         if s["me_hosting"]:
             try:  # every refresh, so there's little time to edit the log before it's read
                 g.record_activity(player)
@@ -418,6 +442,19 @@ class App:
         for title, message in core.events(self.statuses.get(g.world_id), s, self.st.my_id):
             self.notify(f"{name}: {title}" if len(self.groups) > 1 else title, message)
         self.statuses[g.world_id] = s
+
+    def admit_friends(self):
+        try:
+            let_in, wrong = core.admit(self.st, self.groups, self.refused)
+        except Exception:
+            return  # sync engine busy: next refresh
+        for g, name in let_in:
+            self.notify(f"{name} joined {g.info['name']}", "Their copy of the world is starting to sync.")
+        for name in wrong:
+            self.notify("Wrong group password", f"{name} tried to join with a wrong password.")
+            if len(self.refused) == core.GUESSES_PER_HOUR:
+                self.notify("Joining paused for an hour", "Too many wrong passwords. Nobody can join your groups "
+                            "for an hour. Change the password if you didn't expect this.")
 
     def render(self, s):
         """Show one group's status on the My group tab."""
@@ -557,41 +594,123 @@ class App:
             messagebox.showerror("WorldBaton", str(e))
             return
         self.add_group(g)
-        self.invite()
+        if self.ask_password(g):
+            self.invite()
 
     def join_group(self):
-        code = simpledialog.askstring("WorldBaton", "Paste the invite code your friend sent you:", parent=self.root)
+        code = simpledialog.askstring("WorldBaton", "Paste the group code your friend sent you:", parent=self.root)
         if not code:
             return
         try:
             invite = core.decode_invite(code)
+        except Exception as e:
+            messagebox.showerror("WorldBaton", str(e))
+            return
+        password = simpledialog.askstring("WorldBaton", f"Type the password for {invite['g']}:", parent=self.root)
+        if not password:
+            return
+        try:
             squid = tools.squid_servers_dir()
             parent = squid if squid.is_dir() else Path.home() / "WorldBaton servers"
-            g = core.Group.join(self.st, APP_DIR, invite, parent, joined=[x.world_id for x in self.groups])
+            g = core.Group.join(self.st, APP_DIR, invite, parent, password.strip(), self.cfg["player"],
+                                joined=[x.world_id for x in self.groups], waiting=self.waiting_proofs())
         except Exception as e:
             messagebox.showerror("WorldBaton", str(e))
             return
         self.add_group(g)
-        self.code_dialog(f"Send this code back to {invite['on']} so they can let you in:",
-                         core.encode_join(self.st.my_id, self.cfg["player"]))
+        messagebox.showinfo("WorldBaton", f"Asked {invite['on']} to let you in. That happens on its own as soon as "
+                                          f"{invite['on']}'s WorldBaton is open, and the world starts copying.")
+
+    def retry_password(self):
+        g = self.group
+        password = simpledialog.askstring("WorldBaton", f"Type the password for {g.info['name']} again:", parent=self.root)
+        if not password:
+            return
+        try:
+            g.set_join_password(password.strip(), self.cfg["player"], self.waiting_proofs(but=g))
+            save_config(self.cfg)
+        except Exception as e:
+            messagebox.showerror("WorldBaton", str(e))
+
+    def ask_password(self, g, again=False) -> bool:
+        """The owner picks the password friends type to join. False if cancelled."""
+        suggestion = g.info.get("password") or secrets.token_hex(4)
+        while True:
+            pw = simpledialog.askstring(
+                "Group password", f"{'Pick a new' if again else 'Pick a'} password friends type to join {g.info['name']} "
+                f"(at least {core.MIN_PASSWORD} characters).\nShare it only with people you trust with your PC."
+                + ("\nFriends already in the group stay in." if again else ""),
+                initialvalue="" if again else suggestion, parent=self.root)
+            if pw is None:
+                return False
+            try:
+                g.set_password(pw.strip())
+            except ValueError as e:
+                messagebox.showerror("WorldBaton", str(e))
+                continue
+            save_config(self.cfg)
+            return True
 
     def invite(self):
-        win = self.code_dialog("1. Send this invite code to your friend:", self.group.invite_code(self.cfg["player"]))
-        ttk.Label(win, text="2. Paste the join code they send back:").pack(anchor="w", padx=12, pady=(12, 0))
-        entry = ttk.Entry(win, width=60)
-        entry.pack(padx=12, fill="x")
+        g = self.group
+        if not g.is_owner():
+            owner = core.plain_name(self.st.devices().get(g.info["owner"], "")) or g.info.get("owner_name", "the owner")
+            self.code_dialog(f"Send this group code to your friend. Only {owner} knows the password: ask them "
+                                   f"for it. {owner}'s WorldBaton is what lets people in.", g.invite_code(owner))
+            return
+        if not g.info.get("key") and not self.ask_password(g):
+            return  # a group made before passwords
+        win = self.code_dialog("Send your friend the group code and the password. Anyone with both can join while "
+                               "your WorldBaton is open (the tray is enough).", g.invite_code(self.cfg["player"]))
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=12, pady=(12, 12))
+        ttk.Label(row, text=f"Password:  {g.info['password']}", font=("Segoe UI", 11, "bold")).pack(side="left")
+        ttk.Button(row, text="Copy", command=lambda: self.copy(g.info["password"])).pack(side="left", padx=6)
 
-        def add():
+        def change():
+            win.destroy()
+            if self.ask_password(g, again=True):
+                self.invite()
+        ttk.Button(row, text="Change password…", command=change).pack(side="left")
+
+    def remove_friend(self):
+        g = self.group
+        members = (self.statuses.get(g.world_id) or {}).get("members") or []
+        if not members:
+            messagebox.showinfo("WorldBaton", "There's nobody to remove yet.")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Remove a friend")
+        ttk.Label(win, text=f"Who should leave {g.info['name']}?").pack(anchor="w", padx=12, pady=(12, 4))
+        pick = ttk.Combobox(win, values=[m["name"] for m in members], state="readonly", width=30)
+        pick.current(0)
+        pick.pack(padx=12, fill="x")
+
+        def remove():
+            m = members[pick.current()]
+            baton = g.read_baton() or {}
+            hosting = (f"\n\n{m['name']} is hosting right now: that session is lost, and after 5 minutes someone else "
+                       "can host." if baton.get("holder") == m["id"] else "")
+            if not messagebox.askyesno("Remove a friend", f"Remove {m['name']} from {g.info['name']}?\n\nTheir PC stops "
+                                       "syncing with everyone and can't come back, even with the password. They keep "
+                                       f"the copy of the world they already have.{hosting}", icon="warning", parent=win):
+                return
             try:
-                join = core.decode_join(entry.get())
-                self.group.add_member(join)
+                g.remove_member(m["id"])
+                save_config(self.cfg)
             except Exception as e:
                 messagebox.showerror("WorldBaton", str(e), parent=win)
                 return
-            messagebox.showinfo("WorldBaton", f"{join['n']} is in! Their copy of the world will start syncing.", parent=win)
             win.destroy()
+            if messagebox.askyesno("WorldBaton", f"{m['name']} is out. Change the group password too, so someone "
+                                   "they told can't join?"):
+                self.ask_password(g, again=True)
 
-        ttk.Button(win, text="Add friend", command=add).pack(pady=12)
+        buttons = ttk.Frame(win)
+        buttons.pack(pady=12)
+        ttk.Button(buttons, text="Remove", command=remove).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="left")
+        self.popup(win)
 
     def ask_address(self) -> bool:
         """Ask for this PC's tunnel address and remember it. False if cancelled."""

@@ -9,11 +9,10 @@ class Rules(unittest.TestCase):
     def test_codes_round_trip(self):
         code = core.encode_invite("A", "Alex", "Big P", "wb-world-1", "wb-baton-1")
         self.assertEqual(core.decode_invite(code)["g"], "Big P")
-        self.assertEqual(core.decode_join(core.encode_join("B", "Sam"))["n"], "Sam")
+        with self.assertRaisesRegex(ValueError, "older WorldBaton"):
+            core.decode_invite("WBI1-eyJvIjoiQSJ9")
         with self.assertRaises(ValueError):
-            core.decode_invite(core.encode_join("B", "Sam"))
-        with self.assertRaises(ValueError):
-            core.decode_invite("WBI1-%%%")
+            core.decode_invite("WBI2-%%%")
 
     def test_world_mode(self):
         self.assertEqual(core.desired_world_mode(None, ME), ("receiveonly", False))

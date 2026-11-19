@@ -112,6 +112,14 @@ class Syncthing:
             f["devices"].append({"deviceID": device_id})
             self.put(f"/rest/config/folders/{folder_id}", f)
 
+    def unshare_folder(self, folder_id: str, device_id: str) -> None:
+        f = self.get(f"/rest/config/folders/{folder_id}")
+        f["devices"] = [d for d in f["devices"] if d["deviceID"] != device_id]
+        self.put(f"/rest/config/folders/{folder_id}", f)
+
+    def remove_device(self, device_id: str) -> None:
+        self.delete(f"/rest/config/devices/{device_id}")
+
     def folder(self, folder_id: str) -> dict:
         return self.get(f"/rest/config/folders/{folder_id}")
 

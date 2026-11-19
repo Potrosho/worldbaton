@@ -24,9 +24,23 @@ def wait_for(check, what, timeout=120):
 def local_only(st: Syncthing) -> str:
     port = free_port()
     st.patch("/rest/config/options", {"globalAnnounceEnabled": False, "localAnnounceEnabled": False,
-                                      "relaysEnabled": False, "natEnabled": False,
+                                      "relaysEnabled": False, "natEnabled": False, "reconnectionIntervalS": 2,
                                       "listenAddresses": [f"tcp://127.0.0.1:{port}"]})
     return f"tcp://127.0.0.1:{port}"
+
+
+def join(owner_group, joiner, owner_addr, app_dir, servers, player="Sam", password="hunter22", **kw):
+    """A friend joins with the group code and password; the owner's WorldBaton lets them in on its own."""
+    invite = core.decode_invite(owner_group.invite_code("Alex"))
+    g = core.Group.join(joiner, app_dir, invite, servers, password, player, **kw)
+    joiner.patch(f"/rest/config/devices/{invite['o']}", {"addresses": [owner_addr]})  # no discovery in tests
+    return g
+
+
+def let_in(owner, groups, joiner):
+    """Run the owner's WorldBaton check until the joining PC is in."""
+    group = next(g for g in groups if g.world_id == joiner.world_id)
+    wait_for(lambda: core.admit(owner, groups, {}) and joiner.st.my_id in group.member_ids(), "the owner lets them in")
 
 
 @unittest.skipUnless(bundled_exe().exists(), "run scripts/get_syncthing.py first")
@@ -43,7 +57,8 @@ class TwoFriends(unittest.TestCase):
 
     def test_pass_the_world(self):
         a, b = self.a, self.b
-        addr_a, addr_b = local_only(a), local_only(b)
+        addr_a = local_only(a)
+        local_only(b)
 
         server = self.tmp / "alex-server"
         (server / "world").mkdir(parents=True)
@@ -56,11 +71,15 @@ class TwoFriends(unittest.TestCase):
         (server / "user_jvm_args.txt").write_text("-Xmx10G")
 
         ga = core.Group.create(a, self.tmp / "a-app", "Big P", server, "Alex")
-        invite = core.decode_invite(ga.invite_code("Alex"))
-        gb = core.Group.join(b, self.tmp / "b-app", invite, self.tmp / "sam-servers")
-        b.add_device(a.my_id, "Alex", introducer=True, addresses=[addr_a])
-        ga.add_member(core.decode_join(core.encode_join(b.my_id, "Sam")))
-        a.add_device(b.my_id, "Sam", addresses=[addr_b])
+        ga.set_password("hunter22")
+        gb = join(ga, b, addr_a, self.tmp / "b-app", self.tmp / "sam-servers", password="hunter2")  # typo
+        refused = {}
+        wait_for(lambda: core.admit(a, [ga], refused)[1] == ["Sam"], "Alex's WorldBaton turns away a wrong password")
+        self.assertNotIn(b.my_id, a.devices())
+        gb.set_join_password("hunter22", "Sam")
+        self.assertEqual(b.devices()[b.my_id], f"Sam [wb:{gb.info['proof']}]")
+        let_in(a, [ga], gb)
+        self.assertEqual(a.devices()[b.my_id], "Sam", "the proof isn't part of the name friends see")
 
         sam_world = gb.world_path
         wait_for(lambda: gb.local_version() == 1 and gb.status()["need_files"] == 0
@@ -70,6 +89,9 @@ class TwoFriends(unittest.TestCase):
         self.assertFalse((sam_world / "run.bat").exists(), "start scripts hold Alex's Java path")
         self.assertFalse((sam_world / "user_jvm_args.txt").exists(), "RAM setting is per-PC")
         wait_for(lambda: gb.read_baton() and gb.read_baton()["last_host"] == a.my_id, "Sam gets the baton")
+        gb.joined("Sam")
+        self.assertEqual(b.devices()[b.my_id], "Sam")
+        self.assertEqual(b.folder(gb.world_id)["label"], "Big P")
 
         # Sam hosts; Alex must see it and be blocked.
         gb.reconcile()
@@ -126,15 +148,15 @@ class TwoFriends(unittest.TestCase):
     def test_playing_without_the_baton_is_undone(self):
         """Alex (last host) closes WorldBaton, runs the server anyway, then reopens WorldBaton."""
         a, b = self.a, self.b
-        addr_a, addr_b = local_only(a), local_only(b)
+        addr_a = local_only(a)
+        local_only(b)
         server = self.tmp / "alex-server"
         (server / "world").mkdir(parents=True)
         (server / "world" / "level.dat").write_text("day 1")
         ga = core.Group.create(a, self.tmp / "a-app", "Big P", server, "Alex")
-        gb = core.Group.join(b, self.tmp / "b-app", core.decode_invite(ga.invite_code("Alex")), self.tmp / "sam-servers")
-        b.add_device(a.my_id, "Alex", introducer=True, addresses=[addr_a])
-        ga.add_member(core.decode_join(core.encode_join(b.my_id, "Sam")))
-        a.add_device(b.my_id, "Sam", addresses=[addr_b])
+        ga.set_password("hunter22")
+        gb = join(ga, b, addr_a, self.tmp / "b-app", self.tmp / "sam-servers")
+        let_in(a, [ga], gb)
         level_sam = gb.world_path / "world" / "level.dat"
         wait_for(lambda: level_sam.read_text() == "day 1", "Sam gets the world")
 
@@ -164,7 +186,8 @@ class TwoFriends(unittest.TestCase):
 
         ga = core.Group.create(a, self.tmp / "a-app", "Big P", server, "Alex")
         ga.set_backup_dir(backup)
-        gb = core.Group.join(b, self.tmp / "b-app", core.decode_invite(ga.invite_code("Alex")), self.tmp / "sam-servers")
+        gb = core.Group.join(b, self.tmp / "b-app", core.decode_invite(ga.invite_code("Alex")), self.tmp / "sam-servers",
+                             "hunter22", "Sam")
         gb.set_backup_dir(backup)
         sam_world = gb.world_path
         (sam_world / "old-mod.jar").write_text("stale")  # must be removed by the restore
@@ -208,7 +231,8 @@ class TwoFriends(unittest.TestCase):
     def test_two_groups_on_one_pc(self):
         """Alex has two groups; Sam is only in one. Friends, folders and leaving stay per group."""
         a, b = self.a, self.b
-        addr_a, addr_b = local_only(a), local_only(b)
+        addr_a = local_only(a)
+        local_only(b)
         servers = [self.tmp / "alex-modded", self.tmp / "alex-vanilla"]
         for s in servers:
             (s / "world").mkdir(parents=True)
@@ -219,25 +243,65 @@ class TwoFriends(unittest.TestCase):
             with self.assertRaises(ValueError):
                 core.Group.create(a, self.tmp / "a-app", "Again", clash, "Alex", taken=[servers[0], servers[1]])
 
-        invite = core.decode_invite(modded.invite_code("Alex"))
-        sam = core.Group.join(b, self.tmp / "b-app", invite, self.tmp / "sam-servers")
+        modded.set_password("modded1")
+        vanilla.set_password("vanilla1")
+        sam = join(modded, b, addr_a, self.tmp / "b-app", self.tmp / "sam-servers", password="modded1")
         with self.assertRaises(ValueError):  # joining the same group twice
-            core.Group.join(b, self.tmp / "b-app", invite, self.tmp / "sam-servers2", joined=[sam.world_id])
-        b.add_device(a.my_id, "Alex", introducer=True, addresses=[addr_a])
-        modded.add_member(core.decode_join(core.encode_join(b.my_id, "Sam")))
-        a.add_device(b.my_id, "Sam", addresses=[addr_b])
+            join(modded, b, addr_a, self.tmp / "b-app", self.tmp / "sam-servers2", password="modded1",
+                 joined=[sam.world_id])
+        let_in(a, [modded, vanilla], sam)
         wait_for(lambda: sam.local_version() == 1 and (sam.world_path / "world" / "level.dat").exists(),
                  "Sam gets the modded world")
+        sam.joined("Sam")
 
         self.assertEqual([m["name"] for m in modded.status()["members"]], ["Sam"])
         self.assertEqual(vanilla.status()["members"], [], "Sam isn't in the vanilla group")
         self.assertFalse((self.tmp / "sam-servers" / "Vanilla").exists())
+
+        # Alex's PC already knows Sam's now, so this time the proof comes in the folder Sam offers.
+        refused = {}
+        wrong = join(vanilla, b, addr_a, self.tmp / "b-app", self.tmp / "sam-servers", password="modded1")
+        wait_for(lambda: core.admit(a, [modded, vanilla], refused)[1] == ["Sam"], "a wrong password is noticed")
+        self.assertEqual(vanilla.status()["members"], [])
+        sam_vanilla = wrong
+        sam_vanilla.set_join_password("vanilla1", "Sam")  # typed it again, right this time
+        let_in(a, [modded, vanilla], sam_vanilla)
+        wait_for(lambda: (sam_vanilla.world_path / "world" / "level.dat").exists(), "Sam gets the vanilla world")
+        self.assertTrue(a.devices()[b.my_id] == "Sam" and b.devices()[a.my_id] == "Alex")
+        sam_vanilla.leave()
 
         vanilla.leave()
         self.assertFalse(a.has_folder(vanilla.world_id))
         self.assertFalse(a.has_folder(vanilla.baton_id))
         self.assertEqual((servers[1] / "world" / "level.dat").read_text(), "alex-vanilla", "leaving keeps the files")
         self.assertTrue(a.has_folder(modded.world_id))
+
+    def test_remove_a_friend(self):
+        """Sam and Kim join; Alex removes Kim. Sam's PC drops Kim too, and Kim can't get back in with the password."""
+        c = Syncthing(self.tmp / "c-st")
+        c.start()
+        self.addCleanup(c.stop)
+        addr_a = local_only(self.a)
+        local_only(self.b)
+        local_only(c)
+        server = self.tmp / "alex-server"
+        (server / "world").mkdir(parents=True)
+        (server / "world" / "level.dat").write_text("day 1")
+        ga = core.Group.create(self.a, self.tmp / "a-app", "Big P", server, "Alex")
+        ga.set_password("hunter22")
+        sam = join(ga, self.b, addr_a, self.tmp / "b-app", self.tmp / "sam-servers")
+        kim = join(ga, c, addr_a, self.tmp / "c-app", self.tmp / "kim-servers", player="Kim")
+        let_in(self.a, [ga], sam)
+        let_in(self.a, [ga], kim)
+        wait_for(lambda: c.my_id in sam.member_ids() and self.b.my_id in kim.member_ids(), "Alex introduces them")
+
+        ga.remove_member(c.my_id)
+        self.assertNotIn(c.my_id, self.a.devices())
+        wait_for(lambda: c.my_id not in sam.member_ids(), "Sam's PC drops Kim")
+        wait_for(lambda: c.my_id not in self.b.devices(), "and forgets Kim's PC")
+        time.sleep(4)  # Kim's PC keeps knocking with a valid proof
+        self.assertEqual(core.admit(self.a, [ga], {}), ([], []))
+        self.assertNotIn(c.my_id, ga.member_ids())
 
     def test_restore_an_earlier_world(self):
         """Alex hosts twice, then brings back the first session's world; it's shared as a new version."""

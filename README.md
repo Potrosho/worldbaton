@@ -33,9 +33,10 @@ WorldBaton checks for updates each time it opens and offers to install them.
 
 1. **Owner:** open WorldBaton → *Create a group from my server* → pick your server folder
    (SquidServers keeps them in `%LOCALAPPDATA%\SquidServers`).
-2. **Owner:** *Invite a friend* → send them the invite code.
-3. **Friend:** *Join a friend's group* → paste the code → send back the join code it shows.
-4. **Owner:** paste the join code → the world starts copying to your friend.
+2. **Owner:** pick a group password → *Invite a friend* → send them the group code and the password.
+3. **Friend:** *Join a friend's group* → paste the code → type the password.
+4. The owner's WorldBaton lets them in on its own while it's open (the tray is enough), and the world starts
+   copying. Only the owner can let people in, so the owner's PC has to be on for someone to join.
 5. **To play:** press *Host now*, paste your SquidServers tunnel address, start the server in
    SquidServers. When done: stop the server there, then press *Stop hosting* and keep
    WorldBaton open until friends show 100% synced.
@@ -48,6 +49,9 @@ Friends see who is hosting and the address to join with.
   syncing in the background and has its own tunnel address. *Leave this group* keeps the files.
 - **Notifications and tray:** told when someone starts hosting, when their server is up, when it's your turn
   and when the server changes. WorldBaton can stay in the tray and start with Windows (Settings).
+- **Remove a friend** (owner only): their PC stops syncing with everyone and can't come back, even with the
+  password. They keep the copy of the world they already have, so change the password if you're worried
+  they shared it. After 10 wrong passwords in an hour, nobody can join for an hour.
 - **Ask to host next** while someone else hosts; they're told, and you're told when it's your turn.
 - **History:** every session with who hosted and for how long. Each PC keeps its last 2 hosted worlds, and
   any version with a backup can be restored for everyone.
@@ -76,6 +80,9 @@ If your PC crashes while hosting, reopen WorldBaton: as long as nobody took over
 
 - Each group is two Syncthing folders: the **world** (your server folder) and a tiny
   **baton** file (who is hosting, their address, a heartbeat, the world version).
+- Joining: the friend's PC proves it knows the password without sending it (a code made from the password and
+  that PC's ID, which works for no other PC). The owner's WorldBaton checks it and shares the group's folders with
+  that PC; Syncthing then introduces it to everyone else, and removes it from everyone when the owner removes it.
 - Only the last host sends world changes; everyone else's copy is receive-only, so stray
   edits on a friend's PC are undone instead of spread.
 - While you host, your world folder is paused: friends never get half-saved files. Your
