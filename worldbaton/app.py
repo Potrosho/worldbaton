@@ -490,7 +490,8 @@ class App:
         if s["conflicts"]:
             warns.append("Two people changed the baton at the same time. Check who is really hosting before playing.")
         if s["server_running"] and not s["me_hosting"]:
-            warns.append("Your server is running but you aren't the host! Stop it, or your changes will be lost.")
+            warns.append("Your server is running but it isn't your turn! Stop it: what it changes will be undone. "
+                         "Press Host now first next time.")
         self.show_changes(s)
         if self.snapshot:
             warns += core.watch_warnings(self.snapshot)

@@ -85,6 +85,9 @@ If your PC crashes while hosting, reopen WorldBaton: as long as nobody took over
   that PC; Syncthing then introduces it to everyone else, and removes it from everyone when the owner removes it.
 - Only the last host sends world changes; everyone else's copy is receive-only, so stray
   edits on a friend's PC are undone instead of spread.
+- Press *Host now* before starting the server (WorldBaton asks you to stop it otherwise). A server started
+  when it isn't your turn pauses syncing on your PC, so friends never get its half-saved world, and what it
+  changed is undone once it stops.
 - While you host, your world folder is paused: friends never get half-saved files. Your
   session is shared once you press *Stop hosting*.
 - You can only host when your copy matches the newest version. If the host's PC dies,

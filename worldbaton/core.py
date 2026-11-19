@@ -773,19 +773,27 @@ class Group:
         """Put this PC's world folder in the mode the baton says, and drop stray local edits."""
         want_type, want_paused = desired_world_mode(self.read_baton(), self.st.my_id)
         f = self.st.folder(self.world_id)
-        if f["paused"] and not want_paused:
+        if f["paused"] and f["type"] != "receiveonly" and not want_paused:
             return  # we were hosting but lost the baton: keep the session until the player picks Discard
-        if f["type"] == "receiveonly" and not f["paused"]:
-            # Anything changed here without the baton (e.g. a server started while it wasn't our turn)
-            # is undone before this PC may send again. Not while that server runs: wait for it to stop.
-            if server_running(self.world_path):
+        if not want_paused and server_running(self.world_path):
+            # A server running when it isn't this PC's turn: send none of its half-saved world, and don't let the
+            # newer world land under it. Syncthing waits ~10 s after a change before sending; we look every 3 s.
+            if (f["type"], f["paused"]) != ("receiveonly", True):
+                self.st.set_folder(self.world_id, type="receiveonly", paused=True)
+            return
+        if f["type"] == "receiveonly":
+            if f["paused"]:  # that server stopped: what it changed is undone next
+                self.st.set_folder(self.world_id, paused=False)
                 return
             try:
-                if self.st.folder_status(self.world_id).get("receiveOnlyChangedFiles", 0):
-                    self.st.revert(self.world_id)
-                    return  # revert runs in the background; switch modes on a later refresh
+                fs = self.st.folder_status(self.world_id)
             except Exception:
                 return  # folder still starting up; next refresh retries
+            if fs.get("receiveOnlyChangedFiles", 0):
+                self.st.revert(self.world_id)
+                return  # revert runs in the background; switch modes on a later refresh
+            if want_type == "sendreceive" and fs.get("needFiles", 0):
+                return  # the last host undoing a session: get the real world back from a friend before sending again
         if (f["type"], f["paused"]) != (want_type, want_paused):
             self.st.set_folder(self.world_id, type=want_type, paused=want_paused)
 
@@ -819,16 +827,26 @@ class Group:
                 done = None
             members.append({"id": dev_id, "name": plain_name(name) or "Friend", "online": dev_id in online, "synced": done})
         me_hosting = bool(baton and baton.get("holder") == self.st.my_id)
+        running = server_running(self.world_path)
         try:
-            lost = self.st.folder(self.world_id)["paused"] and not me_hosting
+            f = self.st.folder(self.world_id)
         except Exception:
-            lost = False
+            f = {"paused": False, "type": "receiveonly"}
+        lost = f["paused"] and f["type"] != "receiveonly" and not me_hosting
+        if not me_hosting and not lost:
+            if running:
+                can, reason = False, ("Stop the server in SquidServers first, then press Host now. It isn't your turn, "
+                                      "so syncing is paused while it runs, and what it changes will be undone.")
+            elif f["type"] == "receiveonly" and (f["paused"] or fs.get("receiveOnlyChangedFiles", 0) or (
+                    desired_world_mode(baton, self.st.my_id)[0] == "sendreceive" and need)):
+                can, reason = False, ("Undoing what your server changed while it wasn't your turn" +
+                                      (" (needs a friend online)." if need else "…"))
         if self.info.get("proof") and not baton:
             reason = (f"Waiting for {self.info.get('owner_name', 'the owner')} to let you in. Their WorldBaton needs to "
                       "be open (the tray is enough). If nothing happens, check the password with them.")
         return {"baton": baton, "can_host": can and not lost, "reason": reason, "me_hosting": me_hosting, "lost_baton": lost,
                 "holder_alive": holder_alive(baton, now), "need_files": need, "need_bytes": fs.get("needBytes", 0),
-                "server_running": server_running(self.world_path), "members": members,
+                "server_running": running, "members": members,
                 "conflicts": self.conflicts(), "local_version": self.local_version(),
                 "requests": self.requests(), "my_request": self.my_request()}
 
@@ -996,8 +1014,9 @@ class Group:
         ok, reason = host_check(baton, self.st.my_id, self.local_version(), need, time.time(), backup_v)
         if not ok:
             raise ValueError(reason)
-        if server_running(self.world_path) and backup_v:
-            raise ValueError("Stop the server in SquidServers first, so WorldBaton can load the newest world.")
+        if server_running(self.world_path):  # its log so far, and its changes, aren't part of a session
+            raise ValueError("Stop the server in SquidServers first, then press Host now. Start it again once "
+                             "you're the host.")
         # Pause first so nothing from this session leaks out until it is finished.
         self.st.set_folder(self.world_id, type="sendreceive", paused=True)
         if backup_v:

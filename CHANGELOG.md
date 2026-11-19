@@ -10,6 +10,11 @@ update, and as the notes of each GitHub release. Every release needs a section h
 - The owner can remove a friend from a group (Remove a friend...). Everyone's PC stops syncing with theirs, and
   they can't come back, even with the password. They keep the copy of the world they already have.
 - After 10 wrong passwords in an hour, nobody can join for an hour, and the owner is told.
+- Starting your server when it isn't your turn is now caught while WorldBaton is open: syncing pauses for that
+  server, so its half-saved world never reaches friends and the newer world never lands under it. Once it
+  stops, what it changed is undone (before, the last host's changes were sent to everyone).
+- Host now needs the server stopped first (start it once you're the host), so every admin command of a session
+  is in Host activity, including ones typed before pressing Host now.
 - Groups you're already in keep working as they are. Owners of older groups pick a password the next time they
   press Invite a friend. Group codes from older versions don't work anymore: ask for a new one.
 

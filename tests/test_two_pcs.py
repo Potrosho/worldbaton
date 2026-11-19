@@ -1,5 +1,6 @@
 """End-to-end: two Syncthing instances on this PC act as two friends passing the world back and forth."""
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -173,6 +174,54 @@ class TwoFriends(unittest.TestCase):
         wait_for(lambda: (ga.reconcile() or True) and a.folder(ga.world_id)["type"] == "sendreceive",
                  "Alex can send again")
         self.assertEqual(level_sam.read_text(), "day 1")
+
+    def test_server_started_out_of_turn(self):
+        """With WorldBaton open: Alex (last host) and Sam (behind) each start their server without the baton."""
+        a, b = self.a, self.b
+        addr_a = local_only(a)
+        local_only(b)
+        server = self.tmp / "alex-server"
+        (server / "world").mkdir(parents=True)
+        (server / "world" / "level.dat").write_text("day 1")
+        ga = core.Group.create(a, self.tmp / "a-app", "Big P", server, "Alex")
+        ga.set_password("hunter22")
+        gb = join(ga, b, addr_a, self.tmp / "b-app", self.tmp / "sam-servers")
+        let_in(a, [ga], gb)
+        level_sam = gb.world_path / "world" / "level.dat"
+        wait_for(lambda: level_sam.read_text() == "day 1" and gb.read_baton(), "Sam gets the world")
+
+        def server_on(world, on):  # what SquidServers writes; this test's own process stands in for the server
+            (world / ".mc_server_state.json").write_text(json.dumps({"status": "online" if on else "offline",
+                                                                      "pid": os.getpid() if on else None}))
+
+        # Alex, the last host, starts the server without pressing Host now.
+        server_on(server, True)
+        ga.reconcile()
+        self.assertEqual((a.folder(ga.world_id)["type"], a.folder(ga.world_id)["paused"]), ("receiveonly", True))
+        (server / "world" / "level.dat").write_text("half-saved rogue session")
+        self.assertFalse(ga.status()["can_host"])
+        with self.assertRaisesRegex(ValueError, "Stop the server"):
+            ga.start_hosting("Alex", "alex.example")  # commands typed before Host now would be missed
+        time.sleep(12)  # longer than Syncthing waits before sending a change
+        self.assertEqual(level_sam.read_text(), "day 1", "nothing from a server running out of turn is sent")
+
+        server_on(server, False)  # stopped: undone, then Alex sends again
+        wait_for(lambda: (ga.reconcile() or True) and (server / "world" / "level.dat").read_text() == "day 1"
+                 and a.folder(ga.world_id)["type"] == "sendreceive" and not a.folder(ga.world_id)["paused"],
+                 "the rogue session is undone")
+        wait_for(lambda: ga.status()["can_host"], "Alex can host again")
+
+        # Sam starts a server while Alex hosts: the newer world must not land under it.
+        server_on(gb.world_path, True)
+        gb.reconcile()
+        self.assertTrue(b.folder(gb.world_id)["paused"])
+        ga.start_hosting("Alex", "alex.example")
+        (server / "world" / "level.dat").write_text("day 2")
+        ga.stop_hosting("Alex")
+        time.sleep(5)
+        self.assertEqual(level_sam.read_text(), "day 1")
+        server_on(gb.world_path, False)
+        wait_for(lambda: (gb.reconcile() or True) and level_sam.read_text() == "day 2", "Sam gets day 2 once stopped")
 
     def test_never_online_together(self):
         """Alex and Sam are never connected; the world travels only through the shared backup folder."""
