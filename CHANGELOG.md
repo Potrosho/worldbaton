@@ -3,6 +3,11 @@
 What changed in each version, in plain words. WorldBaton shows this in its *What's new* tab, after each
 update, and as the notes of each GitHub release. Every release needs a section here (the release build checks).
 
+## 0.6.0
+- Cloud copy: put the world in free S3 storage such as Cloudflare R2 or Backblaze B2 (Settings → Cloud copy,
+  set once for the whole group). Each Stop hosting uploads it, so anyone in the group can get the newest world
+  and host, even when nobody who has it is online. Earlier sessions there can be restored from History.
+
 ## 0.5.1
 - Opening WorldBaton while it's already running (even hidden in the tray) now brings that window to the front
   instead of starting a second copy. Start with Windows doesn't open a second one either, and it keeps

@@ -60,10 +60,30 @@ Friends see who is hosting and the address to join with.
 - **Checks before hosting:** a nearly full drive, or a SquidServers server set up with a different loader version
   than the group's. (Java, RAM and the player list stay SquidServers' job.)
 
-### Never online at the same time? Add a backup folder
+### Never online at the same time? Add a cloud copy
 
 Normally the world goes straight from PC to PC, so two PCs need to be on together.
-If your group rarely overlaps, share a folder in Google Drive, OneDrive or Dropbox,
+A cloud copy keeps the newest world in S3 storage, so anyone in the group can get it even when
+nobody who has it is online. Cloudflare R2 and Backblaze B2 both have 10 GB free (R2 asks for a card).
+WorldBaton keeps the newest 3 session zips there, so a world up to about 3 GB zipped stays free.
+
+1. Make a bucket (private), and an API key that can read and write it:
+   - **Cloudflare R2:** R2 → Create bucket. Then *Manage API tokens* → Create → *Object Read & Write* for that bucket.
+     The endpoint is `https://<your account id>.r2.cloudflarestorage.com`.
+   - **Backblaze B2:** Buckets → Create a Bucket (Private). Set its *Lifecycle Settings* to
+     "Keep only the last version of the file", or deleted zips keep using space.
+     Then Application Keys → Add a New Application Key with *Read and Write* access to that bucket.
+     The endpoint is shown on the bucket, like `s3.us-west-004.backblazeb2.com`.
+2. In WorldBaton: *Settings* → *Cloud copy*, fill in the endpoint, bucket, key ID and secret, and press
+   *Check and save*. It's saved for the whole group, so only one person does this.
+
+Every *Stop hosting* then uploads the world (*My group* shows the progress). When you want to host and
+your copy is behind, WorldBaton downloads the newest one first. Who is hosting is also shown through
+the cloud. Everyone in the group gets the keys: after removing a friend, make a new key and save it.
+
+### Or a backup folder
+
+Instead of S3 storage, you can share a folder in Google Drive, OneDrive or Dropbox,
 install that drive's desktop app, and in WorldBaton press *Backup folder…* and pick it
 (everyone picks their own copy of the same shared folder).
 
@@ -112,7 +132,7 @@ If your PC crashes while hosting, reopen WorldBaton: as long as nobody took over
 - WorldBaton doesn't host servers itself; you need SquidServers (or to start the server yourself). A basic
   built-in way to run the server may come in a future update.
 - Windows only.
-- Without a backup folder, two PCs must be online at the same time to pass the world on.
+- Without a cloud copy or backup folder, two PCs must be online at the same time to pass the world on.
 - WorldBaton can't tell when a cloud drive has finished uploading; the host has to check.
 - Anyone in the group can host and change the world, so only invite people you trust.
   Syncthing keeps the last 3 versions of changed files in `.stversions` for recovery.

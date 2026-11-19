@@ -6,6 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
+from tests.fake_s3 import FakeS3
 from worldbaton import core
 from worldbaton.syncthing import Syncthing, bundled_exe, free_port
 
@@ -276,6 +277,74 @@ class TwoFriends(unittest.TestCase):
             ga.start_hosting("Alex", "alex.example")
         self.assertEqual(sorted(p.name for p in backup.glob("*.zip")),
                          [f"{ga.world_id}-v{v}.zip" for v in (4, 5, 6)])
+
+    def test_never_online_together_cloud(self):
+        """Alex and Sam are never connected; the world travels only through the group's S3 cloud copy."""
+        fake = FakeS3()
+        self.addCleanup(fake.stop)
+        a, b = self.a, self.b
+        server = self.tmp / "alex-server"
+        (server / "world").mkdir(parents=True)
+        (server / "logs").mkdir()
+        (server / "world" / "level.dat").write_text("day 1")
+        (server / "logs" / "latest.log").write_text("alex only")
+
+        ga = core.Group.create(a, self.tmp / "a-app", "Big P", server, "Alex")
+        ga.info["local_backups"] = 0  # the upload must not depend on this PC keeping its own copies
+        ga.set_cloud(fake.settings())
+        self.assertEqual(json.loads(fake.objects[f"{ga.world_id}-baton.json"][0])["version"], 1)
+        gb = core.Group.join(b, self.tmp / "b-app", core.decode_invite(ga.invite_code("Alex")), self.tmp / "sam-servers",
+                             "hunter22", "Sam")
+        gb.set_group_setting("cloud", fake.settings())  # normally reaches Sam through Syncthing, like all group settings
+        sam_world = gb.world_path
+        (sam_world / "old-mod.jar").write_text("stale")
+        (sam_world / "logs").mkdir()
+        (sam_world / "logs" / "latest.log").write_text("sam only")
+
+        ga.start_hosting("Alex", "alex.example")
+        (server / "world" / "level.dat").write_text("day 2")
+        self.assertEqual(ga.stop_hosting("Alex"), "")
+        self.assertEqual(sorted(k for k in fake.objects if k.endswith(".zip")), [f"{ga.world_id}-v2.zip"])
+        self.assertFalse(list((self.tmp / "a-app").rglob("*.zip")), "the upload's zip is cleaned up")
+        self.assertIsNone(ga.transfer)
+
+        # Sam comes online later: his WorldBaton looks at the cloud and may host from it.
+        gb.cloud.refresh()
+        s = gb.status()
+        self.assertTrue(s["can_host"], s["reason"])
+        self.assertIn("cloud copy", s["reason"])
+        gb.start_hosting("Sam", "sam.example")
+        self.assertEqual((sam_world / "world" / "level.dat").read_text(), "day 2")
+        self.assertEqual(gb.local_version(), 2)
+        self.assertFalse((sam_world / "old-mod.jar").exists())
+        self.assertEqual((sam_world / "logs" / "latest.log").read_text(), "sam only")
+
+        # Alex sees Sam hosting through the cloud alone.
+        ga.cloud.refresh()
+        self.assertEqual(ga.read_baton()["holder"], b.my_id)
+        self.assertFalse(ga.status()["can_host"])
+
+        # Sam stops; Alex's copy (v2) is behind v3, so Alex downloads v3.
+        (sam_world / "world" / "level.dat").write_text("day 3")
+        self.assertEqual(gb.stop_hosting("Sam"), "")
+        ga.cloud.refresh()
+        ga.reconcile()
+        self.assertTrue(ga.status()["can_host"])
+        ga.start_hosting("Alex", "alex.example")
+        self.assertEqual((server / "world" / "level.dat").read_text(), "day 3")
+        self.assertEqual((server / "logs" / "latest.log").read_text(), "alex only")
+        self.assertEqual([b["where"] for b in ga.backups()], ["cloud", "cloud"], "History lists the cloud copies")
+        for v in range(4, 7):  # only the newest few zips are kept
+            ga.stop_hosting("Alex")
+            ga.start_hosting("Alex", "alex.example")
+        self.assertEqual(sorted(k for k in fake.objects if k.endswith(".zip")),
+                         [f"{ga.world_id}-v{v}.zip" for v in (4, 5, 6)])
+
+        # The cloud can't be reached: Stop hosting still shares with online friends, and says so.
+        ga.set_group_setting("cloud", fake.settings(secret="changed"))
+        warning = ga.stop_hosting("Alex")
+        self.assertIn("secret key is wrong", warning)
+        self.assertEqual(ga.read_baton()["holder"], None)
 
     def test_two_groups_on_one_pc(self):
         """Alex has two groups; Sam is only in one. Friends, folders and leaving stay per group."""

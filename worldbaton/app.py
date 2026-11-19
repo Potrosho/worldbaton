@@ -495,6 +495,7 @@ class App:
             warns.append("Your server is running but it isn't your turn! Stop it: what it changes will be undone. "
                          "Press Host now first next time.")
         self.show_changes(s)
+        self.show_backup()
         if self.snapshot:
             warns += core.watch_warnings(self.snapshot)
         self.warning.config(text="\n".join(warns))
@@ -708,6 +709,9 @@ class App:
             if messagebox.askyesno("WorldBaton", f"{m['name']} is out. Change the group password too, so someone "
                                    "they told can't join?"):
                 self.ask_password(g, again=True)
+            if g.cloud:
+                messagebox.showinfo("WorldBaton", f"{m['name']} still has the cloud copy's keys. To lock them out of it "
+                                    "too, make a new key with your storage provider and save it in Settings.")
 
         buttons = ttk.Frame(win)
         buttons.pack(pady=12)
@@ -746,7 +750,9 @@ class App:
         def done(warning):
             if warning:
                 messagebox.showwarning("WorldBaton", warning)
-            tip = ("If you use a cloud drive as the backup folder, wait until it says it's up to date before turning off your PC."
+            tip = ("It's also in the cloud copy, so friends can get it even after you turn off your PC."
+                   if self.group.cloud and not warning else
+                   "If you use a cloud drive as the backup folder, wait until it says it's up to date before turning off your PC."
                    if self.group.backup_dir else "")
             messagebox.showinfo("WorldBaton", "Done! Keep WorldBaton open until your friends show 100% synced.\n" + tip)
             self.post_discord(self.group, f"⚪ **{self.cfg['player']}** stopped hosting **{self.group.info['name']}**. "
@@ -790,9 +796,16 @@ class App:
         self.run_busy("Copying the group's files…", lambda: self.group.move_world(Path(path), taken=others), done)
 
     def show_backup(self):
-        d = self.group.backup_dir
-        self.backup_label.config(text=f"Backup folder: {d}" if d else
-                                 "No backup folder. Only needed if your group is rarely online at the same time.")
+        d, cloud = self.group.backup_dir, self.group.cloud
+        if cloud:
+            newest = max(cloud.zips, default=None)
+            state = (self.group.transfer or (f"couldn't reach it: {cloud.error}" if cloud.error else
+                     f"has version {newest}" if newest else "empty until the next Stop hosting"))
+            text = f"Cloud copy ({cloud.s3.bucket}): {state}"
+        else:
+            text = (f"Backup folder: {d}" if d else
+                    "No cloud copy or backup folder. Only needed if your group is rarely online at the same time.")
+        self.backup_label.config(text=text)
 
     def run_busy(self, text, work, on_done):
         """Run slow work (zipping/unzipping worlds) off the UI thread."""
@@ -810,6 +823,8 @@ class App:
 
         def poll():
             if not result:
+                moving = self.group and self.group.transfer
+                self.reason.config(text=f"{text} {moving}" if moving else text)
                 self.root.after(300, poll)
                 return
             self.busy = False
@@ -957,6 +972,40 @@ class App:
         note("Saved when you press Stop hosting. Each one is about the size of the server folder. Restore one from "
              "the History tab.")
 
+        heading("Cloud copy (whole group)")
+        cfg = self.group.group_settings().get("cloud") or {}
+        fields = {}
+        grid = ttk.Frame(f)
+        grid.pack(anchor="w", fill="x")
+        for row_no, (key, label, hide) in enumerate((("endpoint", "S3 endpoint", False), ("bucket", "Bucket", False),
+                                                     ("key_id", "Access key ID", False),
+                                                     ("secret", "Secret access key", True))):
+            ttk.Label(grid, text=label).grid(row=row_no, column=0, sticky="w", padx=(0, 8), pady=1)
+            fields[key] = tk.StringVar(value=cfg.get(key, ""))
+            ttk.Entry(grid, textvariable=fields[key], width=44, show="•" if hide else "").grid(row=row_no, column=1,
+                                                                                               sticky="we", pady=1)
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(4, 0))
+
+        def save_cloud(turn_off=False):
+            new = None if turn_off else {k: v.get().strip() for k, v in fields.items()}
+            group = self.group
+
+            def done(_):
+                save_config(self.cfg)
+                self.show_backup()
+                messagebox.showinfo("WorldBaton", "The cloud copy is off. Its files stay in your bucket." if turn_off else
+                                    "It works! Saved for the whole group. Each Stop hosting now uploads the world, and "
+                                    "anyone in the group can get it from there.")
+            self.tabs.select(self.body)
+            self.run_busy("Checking the cloud copy…" if new else "Turning off the cloud copy…",
+                          lambda: group.set_cloud(new), done)
+        ttk.Button(row, text="Check and save", command=save_cloud).pack(side="left", padx=(0, 6))
+        if cfg:
+            ttk.Button(row, text="Turn off", command=lambda: save_cloud(turn_off=True)).pack(side="left")
+        note("Free S3 storage such as Cloudflare R2 or Backblaze B2 (10 GB free each). Each Stop hosting uploads the "
+             "world, so friends can host even when nobody who has it is online. Anyone in the group gets these keys.")
+
         heading("My game's mods")
         mods = (self.group.info.get("game_mods") or {}).get("dir")
         ttk.Label(f, text=mods or "Not set yet.", wraplength=470).pack(anchor="w")
@@ -1005,7 +1054,7 @@ class App:
         backups = {b["version"]: b for b in self.group.backups()}
         sessions = self.group.history()
         seen = {e.get("version") for e in sessions}
-        rows = [(e.get("end", 0), e) for e in sessions] + [(b["path"].stat().st_mtime, {"version": v})
+        rows = [(e.get("end", 0), e) for e in sessions] + [(b["mtime"], {"version": v})
                                                            for v, b in backups.items() if v not in seen]
         ttk.Label(f, text="Every finished session, newest first. Versions with a backup can be brought back for "
                           "everyone.", wraplength=470).pack(anchor="w", pady=(0, 8))
@@ -1093,7 +1142,11 @@ class App:
         unsynced = [g.info["name"] for g in self.groups
                     if (s := self.statuses.get(g.world_id)) and s["baton"] and s["baton"].get("last_host") == self.st.my_id
                     and any(m["online"] and (m["synced"] or 0) < 100 for m in s["members"])]
-        if self.hosting():
+        if self.busy:
+            if not messagebox.askyesno("WorldBaton", "WorldBaton is still working (" + (self.reason.cget("text") or
+                                       "busy") + "). Close anyway?"):
+                return
+        elif self.hosting():
             if not messagebox.askyesno("WorldBaton", f"You're hosting {', '.join(self.hosting())}. If you close "
                                        "WorldBaton, friends can take over after 5 minutes and your session won't be "
                                        "shared. Close anyway?"):

@@ -8,6 +8,7 @@ Two Syncthing folders per group:
 
 Optional backup folder (e.g. a shared Google Drive/OneDrive folder) for groups that are never
 online at the same time: each finished session is zipped there, and the baton is mirrored there.
+The cloud copy (S3 storage such as Backblaze B2 or Cloudflare R2, set once for the whole group) does the same.
 """
 import base64
 import ctypes
@@ -20,9 +21,12 @@ import os
 import re
 import secrets
 import shutil
+import threading
 import time
 import zipfile
 from pathlib import Path
+
+from .cloud import S3, CloudError
 
 STALE_AFTER = 300      # seconds without a heartbeat before others may take over
 HEARTBEAT_EVERY = 30
@@ -206,7 +210,8 @@ def newest_baton(*batons) -> dict | None:
     return max(found, key=baton_key) if found else None
 
 
-def host_check(baton, my_id, local_version, need_files, now, backup_version=0) -> tuple[bool, str]:
+def host_check(baton, my_id, local_version, need_files, now, backup_version=0,
+               backup_where="the backup folder") -> tuple[bool, str]:
     """Can this PC start hosting? Returns (allowed, reason shown to the player)."""
     if not baton:
         return False, "Waiting for the group's data from the owner."
@@ -216,7 +221,7 @@ def host_check(baton, my_id, local_version, need_files, now, backup_version=0) -
         return False, f"{baton.get('holder_name', 'Someone')} is hosting right now."
     if local_version < baton.get("version", 0) or need_files:
         if backup_version >= baton.get("version", 0):
-            return True, "Your copy is out of date, so WorldBaton will load the newest world from the backup folder first."
+            return True, f"Your copy is out of date, so WorldBaton will load the newest world from {backup_where} first."
         return False, f"Your copy is out of date. Waiting for the latest world from {baton.get('last_host_name', 'the last host')}."
     if baton.get("holder"):
         return True, (f"{baton.get('holder_name', 'The host')} stopped responding. "
@@ -447,6 +452,96 @@ def replace_synced_files(src: Path, dest: Path, move: bool) -> None:
             (shutil.move if move else shutil.copy2)(p, dest / rel)
 
 
+# --- cloud copy (S3) ---------------------------------------------------------------------
+class CloudCopy:
+    """The group's cloud copy: a zip of each finished session plus a copy of the baton, so friends who are never
+    online together still get the newest world. Reads come from a copy refreshed in the background, so the window
+    never waits on the internet; uploads and downloads run in WorldBaton's busy work."""
+    REFRESH = 300       # seconds between looks at the cloud (a GET and a LIST: well inside free tiers)
+    MIRROR_EVERY = 120  # a host's heartbeat is copied this often (alive means < STALE_AFTER old)
+
+    def __init__(self, cfg: dict, world_id: str):
+        self.cfg, self.world_id = dict(cfg), world_id
+        self.s3 = S3(cfg.get("endpoint", ""), cfg.get("bucket", ""), cfg.get("key_id", ""), cfg.get("secret", ""))
+        self.baton, self.zips = None, {}  # zips: version -> {"size", "mtime"}
+        self.error, self.checked = None, 0.0
+        self._lock = threading.Lock()
+        self._mirrored = (None, 0.0)
+
+    def zip_name(self, v: int) -> str:
+        return f"{self.world_id}-v{v}.zip"
+
+    @property
+    def _baton_name(self) -> str:
+        return f"{self.world_id}-baton.json"
+
+    def refresh(self) -> None:
+        """Look at the cloud now (network: busy work or a background thread only)."""
+        self.checked = time.time()
+        try:
+            found = {}
+            for key, (size, mtime) in self.s3.list(self.world_id + "-v").items():
+                m = re.fullmatch(re.escape(self.world_id) + r"-v(\d+)\.zip", key)
+                if m:
+                    found[int(m.group(1))] = {"size": size, "mtime": mtime}
+            self.baton, self.zips, self.error = self._get_baton(), found, None
+        except CloudError as e:
+            self.error = str(e)
+            raise
+
+    def cached_baton(self) -> dict | None:
+        if time.time() - self.checked > self.REFRESH:
+            self.checked = time.time()  # one look at a time
+            threading.Thread(target=self._quiet, args=(self.refresh,), daemon=True).start()
+        return self.baton
+
+    def _quiet(self, work) -> None:
+        try:
+            work()
+        except Exception as e:
+            self.error = str(e)
+
+    def _get_baton(self) -> dict | None:
+        try:
+            b = json.loads(self.s3.get(self._baton_name) or b"null")
+            return b if isinstance(b, dict) else None
+        except ValueError:
+            return None
+
+    def write_baton(self, baton: dict, now=False) -> None:
+        """Copy the baton up, unless the cloud already has a newer one. now: wait for it (raises CloudError)."""
+        fields = {k: baton.get(k) for k in ("version", "holder", "server_up", "address")}
+        if not now and fields == self._mirrored[0] and time.time() - self._mirrored[1] < self.MIRROR_EVERY:
+            return  # only the heartbeat moved, and it was copied recently
+        self._mirrored = (fields, time.time())
+
+        def work():
+            with self._lock:  # so an older baton never lands on top of a newer one from this PC
+                current = self._get_baton()
+                if current and baton_key(current) > baton_key(baton):
+                    self.baton = current
+                    return
+                self.s3.put(self._baton_name, json.dumps(baton).encode())
+                self.baton = baton
+        if now:
+            work()
+        else:
+            threading.Thread(target=self._quiet, args=(work,), daemon=True).start()
+
+    def upload(self, v: int, path: Path, progress=None) -> None:
+        self.s3.put_file(self.zip_name(v), path, progress)
+        self.refresh()
+        for old in sorted(self.zips)[:-KEEP_BACKUPS]:
+            try:
+                self.s3.delete(self.zip_name(old))
+                self.zips.pop(old, None)
+            except CloudError:
+                pass  # tried again after the next session
+
+    def download(self, v: int, dest: Path, progress=None) -> None:
+        self.s3.get_file(self.zip_name(v), dest, progress)
+
+
 # --- group (uses Syncthing) ------------------------------------------------------------
 class Group:
     def __init__(self, st, info: dict, app_dir: Path):
@@ -457,10 +552,39 @@ class Group:
         self.baton_file = self.app_dir / f"baton-{self.baton_id}" / "baton.json"
         self._logs = {}  # per log file: creation time, bytes read, last bytes read, server pid
         self._by = {}    # activity file -> (mtime, short ID of the PC that last changed it)
+        self._cloud = None
+        self.transfer = None  # e.g. "Uploading the world 42%", for the window to show
 
     @property
     def backup_dir(self) -> Path | None:
         return Path(self.info["backup_dir"]) if self.info.get("backup_dir") else None
+
+    @property
+    def cloud(self) -> CloudCopy | None:
+        """The group's cloud copy, if someone in the group set one up (Settings)."""
+        cfg = self.group_settings().get("cloud")
+        if not cfg:
+            self._cloud = None
+        elif not self._cloud or self._cloud.cfg != cfg:
+            try:
+                self._cloud = CloudCopy(cfg, self.world_id)
+            except ValueError:
+                self._cloud = None  # unusable settings; Settings says what's wrong when they're saved
+        return self._cloud
+
+    def set_cloud(self, cfg: dict | None) -> None:
+        """Turn the cloud copy on (S3 settings) or off (None) for the whole group, and tell it the current state."""
+        if cfg:
+            S3(cfg["endpoint"], cfg["bucket"], cfg["key_id"], cfg["secret"]).check(f"{self.world_id}-check")
+        self.set_group_setting("cloud", cfg)
+        baton = self.read_baton()
+        if cfg and baton:
+            self.cloud.write_baton(baton, now=True)
+
+    def _progress(self, what: str):
+        def show(fraction):
+            self.transfer = f"{what} {fraction:.0%}"
+        return show
 
     def set_backup_dir(self, path) -> None:
         self.info["backup_dir"] = str(path) if path else None
@@ -571,13 +695,17 @@ class Group:
         return self.backup_dir / f"{self.world_id}-baton.json" if self.backup_dir else None
 
     def read_baton(self) -> dict | None:
-        """The newest of the Syncthing baton and the backup-folder copy."""
-        mirror = self._mirror()
-        return newest_baton(self._read_json(self.baton_file), mirror and self._read_json(mirror))
+        """The newest of the Syncthing baton, the backup-folder copy and the cloud copy."""
+        mirror, cloud = self._mirror(), self.cloud
+        return newest_baton(self._read_json(self.baton_file), mirror and self._read_json(mirror),
+                            cloud and cloud.cached_baton())
 
-    def write_baton(self, baton: dict) -> None:
+    def write_baton(self, baton: dict, cloud="background") -> None:
+        """cloud: "background", "now" (wait; raises CloudError) or "skip" (the caller copies it up later)."""
         self._write_json(self.baton_file, baton)
         self.st.scan(self.baton_id)
+        if self.cloud and cloud != "skip":
+            self.cloud.write_baton(baton, now=cloud == "now")
         if self._mirror():
             try:
                 self.backup_dir.mkdir(parents=True, exist_ok=True)
@@ -607,11 +735,15 @@ class Group:
         except (OSError, KeyError, ValueError, zipfile.BadZipFile):
             return None
 
-    def backup_has(self, v: int) -> bool:
+    def _folder_has(self, v: int) -> bool:
         """True if the backup folder holds a complete zip of version v (not still uploading)."""
         return bool(self.backup_dir) and self._zip_version(self._zip(v)) == v
 
-    def _write_zip(self, folder: Path, v: int, keep: int) -> None:
+    def backup_has(self, v: int) -> bool:
+        """True if the backup folder or the cloud copy holds version v."""
+        return self._folder_has(v) or bool(self.cloud and v in self.cloud.zips)
+
+    def _write_zip(self, folder: Path, v: int, keep: int) -> Path:
         folder.mkdir(parents=True, exist_ok=True)
         part = self._zip(v, folder).with_suffix(".zip.part")
         with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as z:
@@ -623,23 +755,26 @@ class Group:
         old = sorted(folder.glob(f"{self.world_id}-v*.zip"), key=lambda p: int(p.stem.rsplit("-v", 1)[1]))
         for p in old[:-keep]:
             p.unlink(missing_ok=True)
+        return self._zip(v, folder)
 
     def save_backup(self, v: int) -> None:
         self._write_zip(self.backup_dir, v, KEEP_BACKUPS)
 
-    def save_local_backup(self, v: int) -> None:
-        self._write_zip(self.local_backup_dir, v, self.keep_local)
+    def save_local_backup(self, v: int) -> Path:
+        return self._write_zip(self.local_backup_dir, v, self.keep_local)
 
     def backups(self) -> list[dict]:
         """Complete backups this PC can restore from, newest first: version, path, where, size."""
-        found = {}
+        cloud = self.cloud.zips if self.cloud else {}
+        found = {v: {"version": v, "path": None, "where": "cloud", **z} for v, z in cloud.items()}
         for where, folder in (("backup folder", self.backup_dir), ("this PC", self.local_backup_dir)):
             if not folder or not folder.is_dir():
                 continue
             for p in folder.glob(f"{self.world_id}-v*.zip"):
                 v = self._zip_version(p)
                 if v is not None:
-                    found[v] = {"version": v, "path": p, "where": where, "size": p.stat().st_size}
+                    info = p.stat()
+                    found[v] = {"version": v, "path": p, "where": where, "size": info.st_size, "mtime": info.st_mtime}
         return sorted(found.values(), key=lambda b: b["version"], reverse=True)
 
     def restore_zip(self, path: Path, v: int) -> None:
@@ -654,7 +789,16 @@ class Group:
         shutil.rmtree(tmp, ignore_errors=True)
 
     def restore_backup(self, v: int) -> None:
-        self.restore_zip(self._zip(v), v)
+        """Load version v from the backup folder, or else download it from the cloud copy."""
+        if self._folder_has(v):
+            return self.restore_zip(self._zip(v), v)
+        tmp = self.app_dir / "download" / f"{self.world_id}-v{v}.zip"
+        try:
+            self.cloud.download(v, tmp, self._progress("Downloading the world"))
+            self.restore_zip(tmp, v)
+        finally:
+            self.transfer = None
+            tmp.unlink(missing_ok=True)
 
     def restore_version(self, player, backup: dict) -> str:
         """Bring back an earlier world for everyone: take the baton, put the backup in place, share it as a new
@@ -663,7 +807,10 @@ class Group:
             raise ValueError("Stop the server in SquidServers first.")
         self.start_hosting(player, "")
         try:
-            self.restore_zip(backup["path"], backup["version"])
+            if backup["path"]:
+                self.restore_zip(backup["path"], backup["version"])
+            else:
+                self.restore_backup(backup["version"])
         except Exception as e:
             self.discard_session()
             self.write_baton({**self.read_baton(), "holder": None})
@@ -811,7 +958,9 @@ class Group:
         except Exception:
             fs = {}
         need = fs.get("needFiles", 0)
-        can, reason = host_check(baton, self.st.my_id, self.local_version(), need, now, self._backup_version(baton, need))
+        backup_v = self._backup_version(baton, need)
+        can, reason = host_check(baton, self.st.my_id, self.local_version(), need, now, backup_v,
+                                 "the backup folder" if backup_v and self._folder_has(backup_v) else "the cloud copy")
         names, online = self.st.devices(), self.st.connected()
         try:  # only this group's friends (other groups' friends are devices too)
             shared = {d["deviceID"] for d in self.st.folder(self.world_id).get("devices", [])}
@@ -1010,6 +1159,11 @@ class Group:
 
     # hosting
     def start_hosting(self, player, address) -> None:
+        if self.cloud:
+            try:
+                self.cloud.refresh()  # decide on what the cloud has now, not up to five minutes ago
+            except CloudError:
+                pass  # offline: Syncthing and the backup folder still count
         baton = self.read_baton()
         need = self.status()["need_files"]
         backup_v = self._backup_version(baton, need)
@@ -1027,8 +1181,11 @@ class Group:
             except Exception as e:
                 self.st.set_folder(self.world_id, type="receiveonly", paused=False)
                 raise ValueError(f"Couldn't load the backup: {e}")
-        self.write_baton({**baton, "holder": self.st.my_id, "holder_name": player, "server_up": False,
-                          "address": address.strip(), "heartbeat": time.time(), "since": time.time()})
+        try:
+            self.write_baton({**baton, "holder": self.st.my_id, "holder_name": player, "server_up": False,
+                              "address": address.strip(), "heartbeat": time.time(), "since": time.time()}, cloud="now")
+        except CloudError:
+            pass  # friends who only see the cloud learn it from a later heartbeat
         self._request_file().unlink(missing_ok=True)  # got what was asked for
         self._skip_old_log()  # only report what happens from now on
         self._marks_file.unlink(missing_ok=True)
@@ -1065,11 +1222,17 @@ class Group:
                 self.save_backup(v)  # before the baton says v exists, so nobody looks for a zip that isn't there
             except OSError as e:
                 warning = f"Couldn't save to the backup folder ({e}). Friends can still get the world while you're online."
+        cloud, zipped = self.cloud, None
         if self.keep_local:
             try:
-                self.save_local_backup(v)
+                zipped = self.save_local_backup(v)
             except OSError as e:
                 warning = (warning + "\n" if warning else "") + f"Couldn't save this PC's world backup ({e})."
+        elif cloud:
+            try:
+                zipped = self._write_zip(self.app_dir / "upload", v, 1)
+            except OSError as e:
+                warning = (warning + "\n" if warning else "") + f"Couldn't zip the world for the cloud copy ({e})."
         entry = {"host": player, "start": baton.get("since", time.time()), "end": time.time(), "version": v}
         if restored_from:
             entry["restored_from"] = restored_from
@@ -1077,9 +1240,29 @@ class Group:
             self._add_history(entry)
         except OSError:
             pass
-        self.write_baton({"version": v, "holder": None, "last_host": self.st.my_id, "last_host_name": player})
+        released = {"version": v, "holder": None, "last_host": self.st.my_id, "last_host_name": player}
+        self.write_baton(released, cloud="skip")  # the cloud only hears of v once it holds v
         self.st.set_folder(self.world_id, type="sendreceive", paused=False)
         self.st.scan(self.world_id)
+        problem = None
+        if cloud and zipped:
+            try:
+                cloud.upload(v, zipped, self._progress("Uploading the world"))
+            except CloudError as e:
+                problem = e
+            finally:
+                self.transfer = None
+                if not self.keep_local:
+                    zipped.unlink(missing_ok=True)
+        if cloud:
+            try:  # even without the zip: friends who only see the cloud then wait for v instead of hosting an old world
+                cloud.write_baton(released, now=True)
+            except CloudError as e:
+                problem = problem or e
+            if problem or not zipped:
+                warning = (warning + "\n" if warning else "") + (
+                    f"Couldn't upload to the cloud copy: {problem or 'no zip'}\n"
+                    "Friends can still get the world from you while you're online.")
         return warning
 
     def leave(self) -> None:
