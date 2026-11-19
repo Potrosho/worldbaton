@@ -3,6 +3,13 @@
 What changed in each version, in plain words. WorldBaton shows this in its *What's new* tab, after each
 update, and as the notes of each GitHub release. Every release needs a section here (the release build checks).
 
+## 0.5.1
+- Opening WorldBaton while it's already running (even hidden in the tray) now brings that window to the front
+  instead of starting a second copy. Start with Windows doesn't open a second one either, and it keeps
+  working if you move WorldBaton.exe.
+- Fixed a false "The server log was edited or cut while hosting" warning that could show up every time the host
+  started the server, because Windows gives the new log file the old one's creation date.
+
 ## 0.5.0
 - Joining is easier: the owner picks a group password, then sends friends the group code and the password. Friends
   paste both and are let in on their own while the owner's WorldBaton is open (the tray is enough). No more

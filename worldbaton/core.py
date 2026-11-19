@@ -873,7 +873,9 @@ class Group:
             info = log.stat()
         except OSError:
             return [], None
-        born = getattr(info, "st_birthtime", info.st_ctime)
+        # Which file this is: its ID, which changes when the server starts a new log. Not its creation time:
+        # Windows gives a new file the creation time of the one it replaces (tested with a real server).
+        born = info.st_ino or getattr(info, "st_birthtime", info.st_ctime)
         pid = server_pid(self.world_path)
         prev = self._logs.get(name)
         pos, warning = 0, None

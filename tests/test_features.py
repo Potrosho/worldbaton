@@ -1,11 +1,13 @@
 """Notifications, asking to host next, history, your game's mods, checks before hosting, Discord links."""
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from worldbaton import core, tools
+from worldbaton.instance import Instance
 from tests.test_watch import FakeSyncthing, make_group
 
 ME, ALEX = "ME-ID", "ALEX-ID"
@@ -209,6 +211,32 @@ class JoiningWithAPassword(unittest.TestCase):
         g = self.group(st, "big", "hunter22")
         g.info["owner"] = "SOMEONE-ELSE"
         self.assertEqual(core.admit(st, [g], {}), ([], []))
+
+
+class OnlyOneWorldBaton(unittest.TestCase):
+    def test_opening_it_again_shows_the_first(self):
+        app_dir = Path(tempfile.mkdtemp())
+        first = Instance(app_dir)
+        self.assertTrue(first.claim())
+        first.listen()
+        later = {}
+
+        def second_copy():  # its own thread, like its own process: the first one owns the lock
+            again = Instance(app_dir)
+            later["claimed"] = again.claim()
+            later["shown"] = again.show_other()
+            later["after_close"] = again.claim(wait=5)  # e.g. restarting after an update
+            again.stop()
+        t = threading.Thread(target=second_copy)
+        t.start()
+        t.join(timeout=3)
+        self.assertEqual((later["claimed"], later["shown"]), (False, True))
+        self.assertEqual(first.shows.get(timeout=1), "show")
+        first.stop()
+        t.join(timeout=10)
+        self.assertTrue(later["after_close"])
+        self.assertFalse((app_dir / "instance-port").exists())
+        self.assertFalse(Instance(app_dir).show_other(), "nobody to show once it's closed")
 
 
 class Discord(unittest.TestCase):

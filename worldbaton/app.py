@@ -15,6 +15,7 @@ import sv_ttk
 
 from . import __version__, changelog, core, tools, updater
 from .app_paths import APP_DIR, ICON
+from .instance import Instance
 from .tray import Tray
 from .syncthing import Syncthing
 
@@ -61,8 +62,9 @@ def upgrade_config(cfg: dict) -> dict:
 
 
 class App:
-    def __init__(self, root: tk.Tk, hidden=False):
+    def __init__(self, root: tk.Tk, hidden=False, instance: Instance | None = None):
         self.root, self.cfg, self.group, self.st = root, load_config(), None, None
+        self.instance = instance  # tells us when WorldBaton is opened again
         self.cfg["settings"] = {**DEFAULT_SETTINGS, **self.cfg.get("settings", {})}
         upgrade_config(self.cfg)
         self.groups: list[core.Group] = []
@@ -831,7 +833,10 @@ class App:
             self.tray.notify(title, message)
 
     def poll_tray(self):
-        """Handle tray menu clicks here, on tkinter's thread."""
+        """Handle tray menu clicks, and WorldBaton being opened again, here on tkinter's thread."""
+        while self.instance and not self.instance.shows.empty():
+            self.instance.shows.get()
+            self.tray.clicks.put("open")
         while not self.tray.clicks.empty():
             click = self.tray.clicks.get()
             self.root.deiconify()
@@ -1100,6 +1105,8 @@ class App:
         self.shutdown()
 
     def shutdown(self):
+        if self.instance:
+            self.instance.stop()  # first, so a restarting WorldBaton (after an update) can take over
         self.tray.stop()
         if self.st:
             for g in self.groups:
@@ -1219,6 +1226,23 @@ def accept_risk(root) -> bool:
 
 
 def main():
+    instance, hidden = Instance(), "--tray" in sys.argv
+    deadline = time.time() + 30
+    while not instance.claim(wait=0.5):  # another WorldBaton is running, starting or closing
+        if hidden or instance.show_other():
+            return  # signing in to Windows: it's already in the tray. Otherwise it's now in front.
+        if time.time() > deadline:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo("WorldBaton", "WorldBaton is already running. Look for its icon in the tray, "
+                                "next to the clock.")
+            return
+    instance.listen()
+    if tools.can_autostart() and tools.autostart_enabled():
+        try:
+            tools.set_autostart(True)  # keep Start with Windows pointing at this .exe, even if it was moved
+        except OSError:
+            pass
     root = tk.Tk()
     sv_ttk.set_theme("dark", root)
     root.tk.call("configure_colors")  # Tk 9 doesn't fire the theme's <<ThemeChanged>> hook, leaving pages light
@@ -1227,10 +1251,12 @@ def main():
         root.iconphoto(True, tk.PhotoImage(file=ICON))  # True: every window and dialog uses it
     except tk.TclError:
         pass  # missing icon file: keep the default rather than fail to start
-    if accept_risk(root):
-        App(root, hidden="--tray" in sys.argv)
-        root.mainloop()
-
+    try:
+        if accept_risk(root):
+            App(root, hidden=hidden, instance=instance)
+            root.mainloop()
+    finally:
+        instance.stop()
 
 if __name__ == "__main__":
     main()

@@ -126,6 +126,21 @@ class Hosting(unittest.TestCase):
                 f.write(b"\n" + NEO.encode() + b"Sam left the game\n")  # normal growth afterwards: no warning
             self.assertEqual(g._new_log_lines("latest.log"), ([NEO[:20], NEO + "Sam left the game"], None))
 
+    def test_server_starts_a_new_log(self):
+        """The normal flow: Host now, then start the server. Minecraft moves latest.log aside and starts a new one;
+        on Windows the new file even keeps the old one's creation time. That's not an edit."""
+        with tempfile.TemporaryDirectory() as d:
+            g = make_group(Path(d))
+            log = g.world_path / "logs" / "latest.log"
+            log.write_text((NEO + "Sam joined the game\n") * 50)  # the last session's log
+            g._skip_old_log()  # Host now
+            time.sleep(0.05)
+            log.rename(log.with_name("2026-11-19-1.log"))
+            log.write_text(NEO + "Made Sam a server operator\n")
+            g.record_activity("Sam")
+            texts = [e["text"] for e in g.activity()]
+        self.assertEqual(texts, ["Console: Made Sam a server operator"])
+
     def test_files_edited_while_server_off(self):
         with tempfile.TemporaryDirectory() as d:
             g = make_group(Path(d))
