@@ -165,6 +165,29 @@ class Hosting(unittest.TestCase):
             g._logs["latest.log"]["rolled_at"] = time.time() - 200
             self.assertIn("was replaced", g._new_log_lines("latest.log")[1])
 
+    def test_log_copied_and_emptied_at_midnight(self):
+        """When another program (SquidServers' console) has latest.log open, Minecraft can't move it aside at
+        midnight: it copies it to the .gz and empties the same file. Same file, now shorter: not an edit."""
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(core, "server_pid", return_value=4242):
+            g = make_group(Path(d))
+            log = g.world_path / "logs" / "latest.log"
+            log.write_text((NEO + "Sam joined the game\n") * 20)
+            g._skip_old_log()
+            with open(log, "a") as f:
+                f.write(NEO + "Made Sam a server operator\n")
+            (log.parent / "2026-11-18-1.log.gz").write_bytes(gzip.compress(log.read_bytes()))
+            with open(log, "r+b") as f:  # emptied in place, then the new day's lines
+                f.truncate(0)
+                f.write((NEO + "[Sam: Gave 1 [Diamond] to Sam]\n").encode())
+            g.record_activity("Sam")
+            self.assertEqual(sorted(e["text"] for e in g.activity()),
+                             ["Console: Made Sam a server operator", "Sam: Gave 1 [Diamond] to Sam"])
+            with open(log, "r+b") as f:  # cut with no matching old log: still caught, after the grace period
+                f.truncate(10)
+            self.assertEqual(g._new_log_lines("latest.log"), ([], None))
+            g._logs["latest.log"]["rolled_at"] = time.time() - 200
+            self.assertIn("was edited or cut", g._new_log_lines("latest.log")[1])
+
     def test_files_edited_while_server_off(self):
         with tempfile.TemporaryDirectory() as d:
             g = make_group(Path(d))

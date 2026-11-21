@@ -122,6 +122,17 @@ class TwoFriends(unittest.TestCase):
                  "Alex's stray edit is reverted")
         self.assertEqual((sam_world / "server.properties").read_text(), "motd=hi")
 
+        # Same, but Sam is away: the group's server.properties can't come back yet. That mustn't stop Alex hosting.
+        b.set_folder(gb.world_id, paused=True)
+        (server / "server.properties").write_text("motd=squidservers rewrote this")
+        a.scan(ga.world_id)
+        wait_for(lambda: (ga.reconcile() or True) and a.folder_status(ga.world_id).get("needFiles") == 1,
+                 "Alex's edit is undone and the group's copy is needed")
+        s = ga.status()
+        self.assertTrue(s["can_host"], s["reason"])
+        b.set_folder(gb.world_id, paused=False)
+        wait_for(lambda: (server / "server.properties").read_text() == "motd=hi", "the group's copy comes back")
+
         # Sam makes a server in SquidServers and switches WorldBaton to it.
         squid = self.tmp / "sam-squidservers" / "Big P (shared)"
         (squid / "world").mkdir(parents=True)

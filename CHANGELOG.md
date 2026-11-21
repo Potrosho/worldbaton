@@ -3,6 +3,12 @@
 What changed in each version, in plain words. WorldBaton shows this in its *What's new* tab, after each
 update, and as the notes of each GitHub release. Every release needs a section here (the release build checks).
 
+## 0.6.2
+- Fixed being stuck on "Your copy is out of date" when only server.properties or eula.txt was missing. SquidServers
+  rewrites those by itself, and WorldBaton then waited for the last host to come online to put them back.
+- Fixed the midnight "The server log was edited or cut while hosting" warning. When SquidServers has the log open,
+  Minecraft empties the same file instead of starting a new one; WorldBaton now handles that too.
+
 ## 0.6.1
 - Fixed a false "The server log was replaced while the server kept running" warning at midnight. Minecraft starts a
   new log each day while the server runs; WorldBaton now reads the end of the old one, so commands typed just

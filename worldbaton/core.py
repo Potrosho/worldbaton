@@ -960,10 +960,23 @@ class Group:
             if fs.get("receiveOnlyChangedFiles", 0):
                 self.st.revert(self.world_id)
                 return  # revert runs in the background; switch modes on a later refresh
-            if want_type == "sendreceive" and fs.get("needFiles", 0):
+            if want_type == "sendreceive" and self._need(fs):
                 return  # the last host undoing a session: get the real world back from a friend before sending again
         if (f["type"], f["paused"]) != (want_type, want_paused):
             self.st.set_folder(self.world_id, type=want_type, paused=want_paused)
+
+    def _need(self, fs: dict) -> int:
+        """Files this PC still needs, not counting server.properties and eula.txt. SquidServers rewrites those by
+        itself; undoing that must not stop anyone hosting while the friend who has the group's copy is offline."""
+        n = fs.get("needFiles", 0)
+        if not 0 < n <= 2:
+            return n
+        try:
+            d = self.st.get(f"/rest/db/need?folder={self.world_id}")
+            names = [x["name"] for k in ("progress", "queued", "rest") for x in d.get(k) or []]
+        except Exception:
+            return n
+        return n if len(names) != n else sum(x not in NOT_EDITS - {VERSION_FILE} for x in names)
 
     def park(self) -> None:
         """On close: stop this PC sending until the next start has read the baton (see reconcile)."""
@@ -978,7 +991,7 @@ class Group:
             fs = self.st.folder_status(self.world_id)
         except Exception:
             fs = {}
-        need = fs.get("needFiles", 0)
+        need = self._need(fs)
         backup_v = self._backup_version(baton, need)
         can, reason = host_check(baton, self.st.my_id, self.local_version(), need, now, backup_v,
                                  "the backup folder" if backup_v and self._folder_has(backup_v) else "the cloud copy")
@@ -1048,29 +1061,32 @@ class Group:
         born = info.st_ino or getattr(info, "st_birthtime", info.st_ctime)
         pid = server_pid(self.world_path)
         prev = self._logs.get(name)
-        pos, warning, rolled = 0, None, []
+        pos, warning, rolled = 0, None, None
         with open(log, "rb") as f:
-            if prev and prev["born"] == born:
+            same = bool(prev) and prev["born"] == born
+            if same:
                 f.seek(max(0, prev["pos"] - len(prev["tail"])))
-                if info.st_size < prev["pos"] or f.read(len(prev["tail"])) != prev["tail"]:
-                    warning = f"⚠ The server log ({name}) was edited or cut while hosting."
-                else:
-                    pos = prev["pos"]
-            elif prev and pid and prev["pid"] == pid:
-                # Minecraft starts a new latest.log at midnight (debug.log at 200 MB) and keeps the old one as
-                # logs/<date>-1.log.gz. Fine if that file is the one we were reading.
-                rolled = rolled_log_rest(log.parent, prev)
-                if rolled is None:
-                    if time.time() - prev.setdefault("rolled_at", time.time()) < 120:
+            if same and info.st_size >= prev["pos"] and f.read(len(prev["tail"])) == prev["tail"]:
+                pos = prev["pos"]  # it only grew
+            elif prev:
+                running = bool(pid) and prev["pid"] == pid
+                if running:
+                    # Minecraft starts a new latest.log on the first line after midnight (debug.log at 200 MB) and
+                    # keeps the old one as logs/<date>-1.log.gz; when another program has the log open, it copies
+                    # and empties it instead. Fine if that file is the one we were reading.
+                    rolled = rolled_log_rest(log.parent, prev)
+                    if rolled is None and time.time() - prev.setdefault("rolled_at", time.time()) < 120:
                         return [], None  # the old log may still be being compressed: look again next time
-                    rolled, warning = [], f"⚠ The server log ({name}) was replaced while the server kept running."
+                if rolled is None and (same or running):
+                    warning = f"⚠ The server log ({name}) was " + ("edited or cut while hosting." if same else
+                                                                  "replaced while the server kept running.")
             f.seek(pos)
             data = f.read()
             end = pos + data.rfind(b"\n") + 1  # leave a half-written last line for next time
             f.seek(max(0, end - 64))
             tail = f.read(end - max(0, end - 64))
         self._logs[name] = {"born": born, "pos": end, "tail": tail, "pid": pid}
-        return rolled + data[:end - pos].decode("utf-8", "replace").splitlines(), warning
+        return (rolled or []) + data[:end - pos].decode("utf-8", "replace").splitlines(), warning
 
     def _skip_old_log(self) -> None:
         self._logs = {}
