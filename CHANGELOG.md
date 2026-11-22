@@ -3,6 +3,15 @@
 What changed in each version, in plain words. WorldBaton shows this in its *What's new* tab, after each
 update, and as the notes of each GitHub release. Every release needs a section here (the release build checks).
 
+## 0.6.3
+- Fixed the same "changed while the server was off" warnings showing up again and again. If saving Host activity
+  failed (for example on a full drive), WorldBaton reported the same files each time it checked.
+- world/level.dat is now compared by its settings (difficulty, game mode, seed, game rules, world border...)
+  instead of by its date. SquidServers rewrites it on every start, so that alone no longer counts as an edit, and a
+  real change now says what it was, like "Difficulty: 2 → 0".
+- While you host, WorldBaton warns you when your drive is nearly full. Syncing stops below 1% free space, and a
+  full drive while the server saves can damage the world.
+
 ## 0.6.2
 - Fixed being stuck on "Your copy is out of date" when only server.properties or eula.txt was missing. SquidServers
   rewrites those by itself, and WorldBaton then waited for the last host to come online to put them back.

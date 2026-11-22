@@ -494,6 +494,8 @@ class App:
         if s["server_running"] and not s["me_hosting"]:
             warns.append("Your server is running but it isn't your turn! Stop it: what it changes will be undone. "
                          "Press Host now first next time.")
+        if s["me_hosting"]:
+            warns += [w for w in [tools.low_disk(self.group.world_path)] if w]
         self.show_changes(s)
         self.show_backup()
         if self.snapshot:

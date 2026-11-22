@@ -96,19 +96,21 @@ class BeforeHosting(unittest.TestCase):
                                        "@libraries/net/neoforged/neoforge/21.1.200/win_args.txt nogui %*")
             (w / "libraries" / "net" / "neoforged" / "neoforge" / "21.1.250").mkdir(parents=True)
             self.assertEqual(tools.loader_from_start_script(w), ("net/neoforged/neoforge", "21.1.200"))
-            with mock.patch("shutil.disk_usage", return_value=mock.Mock(free=100e9)):
+            with mock.patch("shutil.disk_usage", return_value=mock.Mock(free=100e9, total=500e9)):
                 problems = tools.prehost_problems(w)
             self.assertEqual(len(problems), 1)
             self.assertIn("NeoForge 21.1.200", problems[0])
             self.assertIn("uses NeoForge 21.1.250", problems[0])
             (w / "libraries" / "net" / "neoforged" / "neoforge" / "21.1.200").mkdir()
-            with mock.patch("shutil.disk_usage", return_value=mock.Mock(free=1e9)):
+            with mock.patch("shutil.disk_usage", return_value=mock.Mock(free=1e9, total=500e9)):
                 problems = tools.prehost_problems(w)
             self.assertEqual(len(problems), 1)
             self.assertIn("1.0 GB is free", problems[0])
+            with mock.patch("shutil.disk_usage", return_value=mock.Mock(free=8e9, total=930e9)):
+                self.assertIn("stops below 9 GB", tools.low_disk(w))  # Syncthing needs 1% of the drive free
 
     def test_no_start_script_no_complaint(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch("shutil.disk_usage", return_value=mock.Mock(free=100e9)):
+        with tempfile.TemporaryDirectory() as d, mock.patch("shutil.disk_usage", return_value=mock.Mock(free=100e9, total=500e9)):
             self.assertEqual(tools.prehost_problems(Path(d)), [])
 
 

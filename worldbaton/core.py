@@ -16,14 +16,17 @@ import fnmatch
 import gzip
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
 import secrets
 import shutil
+import struct
 import threading
 import time
 import zipfile
+import zlib
 from pathlib import Path
 
 from .cloud import S3, CloudError
@@ -422,8 +425,56 @@ def events(prev: dict | None, cur: dict, me: str) -> list[tuple[str, str]]:
     return out
 
 
+def read_nbt(data: bytes) -> dict:
+    """The root compound of uncompressed NBT data."""
+    f = io.BytesIO(data)
+    sizes = {1: ">b", 2: ">h", 3: ">i", 4: ">q", 5: ">f", 6: ">d"}
+
+    def read(t):
+        if t in sizes:
+            fmt = sizes[t]
+            return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+        if t == 8:
+            return f.read(read(2) & 0xFFFF).decode("utf-8", "replace")
+        if t in (7, 11, 12):
+            n = read(3)
+            return [read({7: 1, 11: 3, 12: 4}[t]) for _ in range(n)]
+        if t == 9:
+            kind, n = read(1), read(3)
+            return [read(kind) for _ in range(n)]
+        if t == 10:
+            out = {}
+            while (kind := read(1)) != 0:
+                name = read(8)
+                out[name] = read(kind)
+            return out
+        raise ValueError(f"unknown NBT tag {t}")
+
+    kind = read(1)
+    read(8)  # root name
+    return read(kind)
+
+
+# What an edit of level.dat could change that matters. SquidServers rewrites the file before each start, and the
+# game saves it all the time, so its time and size say nothing.
+LEVEL_SETTINGS = ("Difficulty", "DifficultyLocked", "hardcore", "GameType", "allowCommands", "DataPacks",
+                  "SpawnX", "SpawnY", "SpawnZ", "BorderSize", "BorderCenterX", "BorderCenterZ")
+
+
+def level_settings(path: Path) -> dict | None:
+    """The settings in a level.dat worth reporting when they change outside the game, or None if unreadable."""
+    try:
+        data = read_nbt(gzip.decompress(path.read_bytes()))["Data"]
+    except (OSError, EOFError, ValueError, KeyError, TypeError, struct.error, zlib.error, gzip.BadGzipFile):
+        return None
+    out = {k: data[k] for k in LEVEL_SETTINGS if k in data}
+    out["seed"] = (data.get("WorldGenSettings") or {}).get("seed")
+    out |= {f"gamerule {k}": v for k, v in (data.get("GameRules") or {}).items()}
+    return out
+
+
 def file_marks(world_path: Path) -> dict:
-    """Size and modified time of every synced file, to spot files changed outside the game."""
+    """Size and modified time of every synced file (level.dat: its settings), to spot files changed outside the game."""
     world_path, out = Path(world_path), {}
     for p in world_path.rglob("*"):
         rel = p.relative_to(world_path).as_posix()
@@ -432,7 +483,7 @@ def file_marks(world_path: Path) -> dict:
         try:
             if p.is_file():
                 info = p.stat()
-                out[rel] = [info.st_mtime_ns, info.st_size]
+                out[rel] = (p.name == "level.dat" and level_settings(p)) or [info.st_mtime_ns, info.st_size]
         except OSError:
             pass
     return out
@@ -446,7 +497,12 @@ def describe_edits(before: dict, after: dict, world_path: Path) -> str | None:
         names = {u["uuid"]: u["name"] for u in json.loads((Path(world_path) / "usercache.json").read_text())}
     except (OSError, ValueError, KeyError, TypeError):
         names = {}
-    shown = [f"{c} ({names[Path(c).stem]})" if Path(c).stem in names else c for c in changed[:6]]
+    def what(c):
+        old, new = before.get(c), after.get(c)
+        if isinstance(old, dict) and isinstance(new, dict):  # level.dat: name the settings
+            return f"{c} ({', '.join(f'{k}: {old.get(k)} → {new.get(k)}' for k in sorted(old.keys() | new.keys()) if old.get(k) != new.get(k))})"
+        return f"{c} ({names[Path(c).stem]})" if Path(c).stem in names else c
+    shown = [what(c) for c in changed[:6]]
     more = f" (+{len(changed) - 6} more)" if len(changed) > 6 else ""
     return f"⚠ Files changed while the server was off, not by the game: {', '.join(shown)}{more}"
 
@@ -1125,7 +1181,10 @@ class Group:
         tmp = self.activity_file.with_suffix(".tmp")
         tmp.write_text("".join(json.dumps(e) + "\n" for e in entries[-KEEP_ACTIVITY:]), encoding="utf-8")
         os.replace(tmp, self.activity_file)
-        self.st.scan(self.baton_id)
+        try:
+            self.st.scan(self.baton_id)
+        except Exception:
+            pass  # e.g. Syncthing stopped for a full drive; its own rescans pick the file up later
 
     def watch_offline_edits(self, player) -> None:
         """While hosting: remember the files when the server stops, report what changed by the time it starts again."""
@@ -1137,11 +1196,11 @@ class Group:
 
     def report_offline_edits(self, player) -> None:
         before = self._read_json(self._marks_file)
+        self._marks_file.unlink(missing_ok=True)  # first, so a failure below can't report the same files again
         if before is not None:
             text = describe_edits(before, file_marks(self.world_path), self.world_path)
             if text:
                 self.add_activity(player, [(time.strftime("%d%b%Y %H:%M:%S"), text)])
-        self._marks_file.unlink(missing_ok=True)
 
     @staticmethod
     def read_activity_file(path: Path) -> list[dict]:

@@ -207,6 +207,46 @@ class Hosting(unittest.TestCase):
         self.assertEqual(texts, [f"⚠ Files changed while the server was off, not by the game: "
                                  f"world/playerdata/{uuid}.dat (Potrosh0)"])
 
+    def test_level_dat_compared_by_its_settings(self):
+        """SquidServers rewrites level.dat before each start: only a changed setting is reported, by name."""
+        def level_dat(difficulty, time_of_day):
+            def s(text):
+                return len(text).to_bytes(2, "big") + text.encode()
+            data = (b"\x0a" + s("") + b"\x0a" + s("Data") + b"\x01" + s("Difficulty") + bytes([difficulty]) +
+                    b"\x04" + s("Time") + time_of_day.to_bytes(8, "big") +
+                    b"\x0a" + s("GameRules") + b"\x08" + s("keepInventory") + s("false") + b"\x00" + b"\x00\x00")
+            return gzip.compress(data)
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(core, "server_pid", return_value=None):
+            g = make_group(Path(d))
+            (g.world_path / "world").mkdir()
+            level = g.world_path / "world" / "level.dat"
+            level.write_bytes(level_dat(2, 1000))
+            g.watch_offline_edits("Sam")
+            level.write_bytes(level_dat(2, 1001) + b"")  # rewritten, same settings
+            g.report_offline_edits("Sam")
+            self.assertEqual(g.activity(), [])
+            g.watch_offline_edits("Sam")
+            level.write_bytes(level_dat(0, 1002))  # peaceful
+            g.report_offline_edits("Sam")
+            self.assertIn("world/level.dat (Difficulty: 2 → 0)", g.activity()[0]["text"])
+
+    def test_offline_edits_reported_once_when_syncthing_fails(self):
+        class Failing(FakeSyncthing):
+            def scan(self, folder_id):
+                raise OSError("insufficient space on disk")
+
+        with tempfile.TemporaryDirectory() as d:
+            g = make_group(Path(d), Failing())
+            with mock.patch.object(core, "server_pid", return_value=None):
+                g.watch_offline_edits("Sam")
+            (g.world_path / "mods").mkdir()
+            (g.world_path / "mods" / "x.jar").write_text("new")
+            with mock.patch.object(core, "server_pid", return_value=4242):
+                g.watch_offline_edits("Sam")
+                g.watch_offline_edits("Sam")  # the next refresh: nothing new to report
+            self.assertEqual(len(g.activity()), 1)
+
     def test_closed_while_hosting(self):
         with tempfile.TemporaryDirectory() as d:
             g = make_group(Path(d))

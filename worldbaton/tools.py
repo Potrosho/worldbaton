@@ -100,15 +100,23 @@ def loader_from_start_script(world_path: Path) -> tuple[str, str] | None:
     return None
 
 
-def prehost_problems(world_path: Path) -> list[str]:
-    world_path, out = Path(world_path), []
+def low_disk(world_path: Path) -> str | None:
+    """A warning if the server's drive is nearly full, else None."""
     try:
-        free = shutil.disk_usage(world_path).free / 1e9
-        if free < LOW_DISK_GB:
-            out.append(f"Only {free:.1f} GB is free on this drive. If it fills up while the server is saving, "
-                       "the world can get damaged. Free up some space first.")
+        disk = shutil.disk_usage(world_path)
     except OSError:
-        pass
+        return None
+    need = max(LOW_DISK_GB * 1e9, disk.total / 100)  # Syncthing stops syncing below 1% free
+    if disk.free >= need:
+        return None
+    return (f"Only {disk.free / 1e9:.1f} GB is free on this drive. Syncing with friends stops below "
+            f"{need / 1e9:.0f} GB, and if the drive fills up while the server is saving, the world can get damaged. "
+            "Free up some space (old SquidServers backups are often the biggest).")
+
+
+def prehost_problems(world_path: Path) -> list[str]:
+    world_path = Path(world_path)
+    out = [w for w in [low_disk(world_path)] if w]
     found = loader_from_start_script(world_path)
     if found:
         loader, version = found
